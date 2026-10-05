@@ -24,6 +24,40 @@ const consentAllChecked = () => Object.values(consent).every(Boolean);
 
 let busy = false; // true while a tx is broadcasting/confirming — disables the relevant button
 
+// Draft values for the three free-text inputs, held in state rather than read back from the
+// DOM. renderAll() runs every 60s (background poll) and after every action, fully replacing
+// each panel's innerHTML — without this, a user mid-typing a deposit amount would see it
+// silently wiped by the next background refresh. Restored as each input's `value` on render.
+let draftDepositAmount = "";
+let draftWithdrawShares = "";
+let draftLookupId = "";
+
+// Non-blocking status banner — replaces alert() for anything that isn't a hard validation
+// stop, since a broadcast can take minutes to confirm and shouldn't freeze the page.
+type StatusKind = "info" | "success" | "error";
+let status: { message: string; kind: StatusKind } | null = null;
+function setStatus(message: string, kind: StatusKind): void {
+  status = { message, kind };
+  renderStatusBanner();
+}
+function clearStatus(): void {
+  status = null;
+  renderStatusBanner();
+}
+function renderStatusBanner(): void {
+  const el = document.getElementById("status-banner");
+  if (!el) return;
+  if (!status) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.className = `status-banner ${status.kind}`;
+  el.innerHTML = `<span>${status.message}</span><button class="secondary" id="btn-dismiss-status">Dismiss</button>`;
+  document.getElementById("btn-dismiss-status")!.addEventListener("click", clearStatus);
+}
+
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
@@ -86,7 +120,7 @@ async function onConnect(): Promise<void> {
     networkOk = net.ok;
     await refreshAll();
   } catch (err) {
-    alert(`Connect failed: ${(err as Error).message}`);
+    setStatus(`Connect failed: ${(err as Error).message}`, "error");
   }
 }
 
@@ -198,7 +232,7 @@ function renderDepositPanel(): void {
   el.innerHTML = `
     <div class="field">
       <label>Amount (STX) — up to ${fmt(headroom, 2)} STX of headroom remaining</label>
-      <input type="number" id="deposit-amount" min="0" step="0.000001" max="${headroom}" ${!connected || full ? "disabled" : ""} />
+      <input type="number" id="deposit-amount" min="0" step="0.000001" max="${headroom}" value="${draftDepositAmount}" ${!connected || full ? "disabled" : ""} />
     </div>
     <button id="btn-deposit" ${!connected || !gateOpen || full || busy ? "disabled" : ""}>Deposit</button>
     ${notice}
@@ -208,6 +242,7 @@ function renderDepositPanel(): void {
   amountInput?.addEventListener("input", () => {
     const v = Number(amountInput.value);
     if (v > headroom) amountInput.value = String(headroom);
+    draftDepositAmount = amountInput.value;
   });
   document.getElementById("btn-deposit")?.addEventListener("click", onDeposit);
 }
@@ -218,7 +253,7 @@ async function onDeposit(): Promise<void> {
   const amount = Number(amountInput.value);
   const headroom = Math.max(0, vault.maxTvlStx - vault.totalAssetsStx);
   if (!(amount > 0) || amount > headroom) {
-    alert("Enter a valid amount within the remaining cap headroom.");
+    setStatus("Enter a valid amount within the remaining cap headroom.", "error");
     return;
   }
   busy = true;
@@ -226,11 +261,16 @@ async function onDeposit(): Promise<void> {
   try {
     const { txid } = await depositStx(address, amount);
     if (!txid) throw new Error("no txid returned — the request may have been rejected in your wallet");
-    alert(`Broadcast: ${txid}\nConfirming — this can take a few minutes. The page will refresh automatically.`);
+    setStatus(`Broadcast: ${txid} — confirming, this can take a few minutes…`, "info");
     const outcome = await waitForTx(txid);
-    if (outcome.status !== "success") alert(`Transaction did not succeed: ${outcome.status}${outcome.repr ? ` — ${outcome.repr}` : ""}`);
+    if (outcome.status === "success") {
+      draftDepositAmount = "";
+      setStatus(`Deposit confirmed: ${txid}`, "success");
+    } else {
+      setStatus(`Transaction did not succeed: ${outcome.status}${outcome.repr ? ` — ${outcome.repr}` : ""}`, "error");
+    }
   } catch (err) {
-    alert(`Deposit failed: ${(err as Error).message}`);
+    setStatus(`Deposit failed: ${(err as Error).message}`, "error");
   } finally {
     busy = false;
     await refreshAll();
@@ -314,7 +354,7 @@ function renderWithdrawPanel(): void {
   el.innerHTML = `
     <div class="field">
       <label>Request a withdrawal — shares to redeem (you hold ${fmt(shareBalance, 6)})</label>
-      <input type="number" id="withdraw-shares" min="0" step="0.000001" max="${shareBalance}" />
+      <input type="number" id="withdraw-shares" min="0" step="0.000001" max="${shareBalance}" value="${draftWithdrawShares}" />
     </div>
     <button id="btn-request-withdrawal" ${shareBalance <= 0 || busy ? "disabled" : ""}>Request withdrawal</button>
     <p class="notice">Takes about ${blocksToEta(etaBlocks)} from request to claimable, and can be rejected at request time (not paused) if the vault's capital is currently deployed to the strategy.</p>
@@ -324,12 +364,17 @@ function renderWithdrawPanel(): void {
     <div class="field" style="margin-top:16px">
       <label>Check a withdrawal by id (e.g. if you're on a different device)</label>
       <div style="display:flex; gap:8px">
-        <input type="number" id="lookup-id" min="0" step="1" />
+        <input type="number" id="lookup-id" min="0" step="1" value="${draftLookupId}" />
         <button class="secondary" id="btn-lookup">Check</button>
       </div>
       <div id="lookup-result"></div>
     </div>
   `;
+
+  const sharesInput = document.getElementById("withdraw-shares") as HTMLInputElement;
+  sharesInput.addEventListener("input", () => { draftWithdrawShares = sharesInput.value; });
+  const lookupInput = document.getElementById("lookup-id") as HTMLInputElement;
+  lookupInput.addEventListener("input", () => { draftLookupId = lookupInput.value; });
 
   document.getElementById("btn-request-withdrawal")?.addEventListener("click", onRequestWithdrawal);
   el.querySelectorAll<HTMLButtonElement>("button[data-claim-id]").forEach((btn) => {
@@ -344,7 +389,7 @@ async function onRequestWithdrawal(): Promise<void> {
   const input = document.getElementById("withdraw-shares") as HTMLInputElement;
   const shares = Number(input.value);
   if (!(shares > 0) || shares > shareBalance) {
-    alert("Enter a valid share amount you actually hold.");
+    setStatus("Enter a valid share amount you actually hold.", "error");
     return;
   }
   busy = true;
@@ -352,17 +397,22 @@ async function onRequestWithdrawal(): Promise<void> {
   try {
     const { txid } = await requestWithdrawal(address, shares);
     if (!txid) throw new Error("no txid returned — the request may have been rejected in your wallet");
-    alert(`Broadcast: ${txid}\nConfirming — this can take a few minutes.`);
+    setStatus(`Broadcast: ${txid} — confirming, this can take a few minutes…`, "info");
     const outcome = await waitForTx(txid);
     if (outcome.status === "success") {
       const id = parseOkUintRepr(outcome.repr);
-      if (id !== null) rememberWithdrawalId(address, id);
-      else alert("Withdrawal request confirmed, but its id could not be read automatically — use the lookup field once you know it.");
+      if (id !== null) {
+        rememberWithdrawalId(address, id);
+        draftWithdrawShares = "";
+        setStatus(`Withdrawal #${id} requested and confirmed: ${txid}`, "success");
+      } else {
+        setStatus("Withdrawal request confirmed, but its id could not be read automatically — use the lookup field once you know it.", "error");
+      }
     } else {
-      alert(`Withdrawal request did not succeed: ${outcome.status}${outcome.repr ? ` — ${outcome.repr}` : ""}`);
+      setStatus(`Withdrawal request did not succeed: ${outcome.status}${outcome.repr ? ` — ${outcome.repr}` : ""}`, "error");
     }
   } catch (err) {
-    alert(`Withdrawal request failed: ${(err as Error).message}`);
+    setStatus(`Withdrawal request failed: ${(err as Error).message}`, "error");
   } finally {
     busy = false;
     await refreshAll();
@@ -375,11 +425,12 @@ async function onClaim(id: number): Promise<void> {
   try {
     const { txid } = await claimWithdrawal(id);
     if (!txid) throw new Error("no txid returned — the request may have been rejected in your wallet");
-    alert(`Broadcast: ${txid}\nConfirming — this can take a few minutes.`);
+    setStatus(`Broadcast: ${txid} — confirming, this can take a few minutes…`, "info");
     const outcome = await waitForTx(txid);
-    if (outcome.status !== "success") alert(`Claim did not succeed: ${outcome.status}${outcome.repr ? ` — ${outcome.repr}` : ""}`);
+    if (outcome.status === "success") setStatus(`Withdrawal #${id} claimed: ${txid}`, "success");
+    else setStatus(`Claim did not succeed: ${outcome.status}${outcome.repr ? ` — ${outcome.repr}` : ""}`, "error");
   } catch (err) {
-    alert(`Claim failed: ${(err as Error).message}`);
+    setStatus(`Claim failed: ${(err as Error).message}`, "error");
   } finally {
     busy = false;
     await refreshAll();
@@ -413,6 +464,7 @@ function renderLookupResult(): void {
 // ---------------------------------------------------------------------------
 
 function renderAll(): void {
+  renderStatusBanner();
   renderWalletArea();
   renderVaultStats();
   renderConsentGate();
