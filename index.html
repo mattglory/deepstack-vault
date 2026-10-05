@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepStack Vault — deposit</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">DeepStack <span class="muted">vault</span></div>
+    <div id="wallet-area"></div>
+  </header>
+
+  <main>
+    <section class="panel" id="vault-stats">
+      <h2>Vault status</h2>
+      <div id="vault-stats-body" class="skeleton">loading…</div>
+    </section>
+
+    <section class="panel warn" id="consent-gate">
+      <h2>Before you deposit — read this</h2>
+      <div id="consent-body"></div>
+    </section>
+
+    <section class="panel" id="deposit-panel">
+      <h2>Deposit</h2>
+      <div id="deposit-body"></div>
+    </section>
+
+    <section class="panel" id="position-panel" hidden>
+      <h2>Your position</h2>
+      <div id="position-body"></div>
+    </section>
+
+    <section class="panel" id="withdraw-panel" hidden>
+      <h2>Withdraw</h2>
+      <div id="withdraw-body"></div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Contract: <code id="vault-addr-footer"></code> ·
+      <a href="https://github.com/mattglory/deepstack" target="_blank" rel="noopener">source</a> ·
+      <a href="https://github.com/mattglory/deepstack/blob/main/docs/VAULT_DISCLOSURE.md" target="_blank" rel="noopener">full disclosure</a>
+    </p>
+  </footer>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

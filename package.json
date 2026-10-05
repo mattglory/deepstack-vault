@@ -1,0 +1,22 @@
+{
+  "name": "deepstack-vault-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Third-party deposit frontend for the DeepStack vault (deepstack-vault.clar) on Stacks mainnet.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@stacks/connect": "^8.2.7",
+    "@stacks/transactions": "^7.6.0"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2"
+  }
+}
