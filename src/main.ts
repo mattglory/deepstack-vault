@@ -93,6 +93,12 @@ async function refreshAll(): Promise<void> {
     }
   } catch (err) {
     console.error("refresh failed", err);
+    // A failed FIRST load must not leave the page stuck on "loading..." forever with no
+    // indication anything is wrong (exactly what happened live on 2026-10-06, caught by a
+    // real browser session, before this fix existed). A failed background refresh (vault
+    // already loaded once) is quieter -- the stats just go stale, no need to alarm the user
+    // over one missed poll.
+    if (!vault) setStatus(`Couldn't load vault data: ${(err as Error).message}. Retrying automatically.`, "error");
   }
   renderAll();
 }

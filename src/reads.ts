@@ -4,11 +4,16 @@
 import { Cl, ClarityValue, cvToJSON, fetchCallReadOnlyFunction } from "@stacks/transactions";
 import { HIRO_API_BASE, HIRO_API_KEY, TOKEN_CONTRACT_NAME, VAULT_ADDRESS, VAULT_CONTRACT_NAME } from "./config";
 
+// Always returns a NEW wrapper function, never the bare native `fetch` reference. Callers
+// (fetchCallReadOnlyFunction) invoke this as `client.fetch(url, init)` -- a method call on an
+// object, not `window.fetch(...)`. Native fetch throws "Illegal invocation" when called with
+// any `this` other than window/the realm global, so handing back the bare reference broke
+// every read in production the moment HIRO_API_KEY was unset (caught live, 2026-10-06 --
+// typecheck/build can't catch this, since it's only wrong at the call site, not the type).
 function hiroFetch(): typeof fetch {
   const key = HIRO_API_KEY;
-  if (!key) return fetch;
   return ((url: Parameters<typeof fetch>[0], init?: RequestInit) =>
-    fetch(url, { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } })) as typeof fetch;
+    fetch(url, key ? { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } } : init)) as typeof fetch;
 }
 
 async function readOnly(contractName: string, functionName: string, args: ClarityValue[] = [], senderAddress = VAULT_ADDRESS) {

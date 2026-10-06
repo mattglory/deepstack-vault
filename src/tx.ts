@@ -3,11 +3,14 @@
 
 import { HIRO_API_BASE, HIRO_API_KEY } from "./config";
 
+// Same fix as reads.ts's hiroFetch() -- always wrap, never hand back the bare native `fetch`
+// reference. This file's own call sites happen to call it as a free function (safe either
+// way), but keeping both copies identical means that stops being true by accident if either
+// ever changes.
 function hiroFetch(): typeof fetch {
   const key = HIRO_API_KEY;
-  if (!key) return fetch;
   return ((url: Parameters<typeof fetch>[0], init?: RequestInit) =>
-    fetch(url, { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } })) as typeof fetch;
+    fetch(url, key ? { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } } : init)) as typeof fetch;
 }
 
 export interface TxOutcome {
