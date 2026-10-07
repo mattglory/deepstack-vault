@@ -32,6 +32,25 @@ operator controls, because nothing operator-controlled is ever present in this c
   the full WalletConnect/Reown AppKit SDK (~550KB minified, for QR-code mobile wallet
   support), and a visitor who only wants to read public vault stats shouldn't pay that
   download cost before ever clicking "Connect wallet."
+- **Every transaction uses exact post-conditions in Deny mode**, and Deny mode covers every
+  principal in the transaction, the vault contract included. A claim therefore declares two
+  movements out of the vault: the locked STX payout and the burn of the escrowed dsSTX (the
+  node logs a burn as a transfer from the burner). Both amounts are re-read from the chain
+  right before signing. See `src/writes.ts`.
+- **Reads are independent and never fake a zero** (`src/reads.ts`, `src/hiro.ts`). Each value
+  is read on its own with a per-request timeout, jittered retries and a small concurrency cap.
+  A failed read keeps the last good value, marked as stale, and a never-loaded value shows as
+  "unavailable", never as 0.
+- **The app refuses transactions the contract is certain to reject**: deposits while paused or
+  over the cap, withdrawal requests larger than the vault's free STX or worth 0 STX. The share
+  math in `src/math.ts` mirrors the contract's `assets-for-shares` / `shares-for-deposit`
+  exactly, in bigint.
+- **Queued admin changes are shown with countdowns.** The timelock only protects depositors who
+  can see a change coming, so the app reads `get-pending-*` for the cap, fee, fee recipient
+  and admin.
+- **Durations come from the measured block pace**, not a constant. The contract's block counts
+  were sized for ~15.25 s/block, but mainnet ran at ~13.4 s/block over the first real
+  withdrawal, so "2 days" and "7 days" are shorter in real time.
 
 ## Known limitations (disclosed, not hidden)
 
@@ -49,6 +68,14 @@ operator controls, because nothing operator-controlled is ever present in this c
   shares pro-rata when it fires — there's no separate fee event triggered by an individual
   withdrawal. The "Your position" panel shows your share's current value, which already
   reflects any past fee dilution.
+
+## Debugging note: "blocked by CORS policy" on api.mainnet.hiro.so
+
+Hiro's error responses (intermittent `503 upstream connect error`, and `429` rate limits)
+carry no `Access-Control-Allow-Origin` header, so the browser reports them as CORS failures
+and hides the real status. It is almost never an actual CORS misconfiguration. The app
+retries these automatically; a burst of them in the console usually means the API was flaky
+or the IP ran out of unauthenticated quota (50 requests/min).
 
 ## Development
 

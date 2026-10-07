@@ -1,47 +1,20 @@
-// All on-chain reads for this app — no backend, every call goes straight from the browser to
-// the Hiro API via fetchCallReadOnlyFunction. See config.ts for the API key wiring.
+// All on-chain reads for this app. No backend: every call goes straight from the browser to
+// the Hiro API (hiro.ts handles key, timeout, retry and concurrency).
+//
+// Two rules, both learned the hard way in this project:
+// 1. A failed read is UNKNOWN, never zero. Parsers throw on an unexpected shape instead of
+//    defaulting. (The main repo's Sep 15 incident: failed reads silently became literal 0.00
+//    and drove a wrong decision.)
+// 2. Each value is read and reported independently (readFields), so one failed call leaves
+//    one number stale instead of throwing away the whole refresh, which is what Promise.all
+//    used to do on a single rejection.
 
 import { Cl, ClarityValue, cvToJSON, fetchCallReadOnlyFunction } from "@stacks/transactions";
-import { HIRO_API_BASE, HIRO_API_KEY, TOKEN_CONTRACT_NAME, VAULT_ADDRESS, VAULT_CONTRACT_NAME } from "./config";
+import { HIRO_API_BASE, TOKEN_CONTRACT_NAME, VAULT_ADDRESS, VAULT_CONTRACT_NAME } from "./config";
+import { hiroCall, hiroFetch, hiroGetJson } from "./hiro";
 
-// Always returns a NEW wrapper function, never the bare native `fetch` reference. Callers
-// (fetchCallReadOnlyFunction) invoke this as `client.fetch(url, init)` -- a method call on an
-// object, not `window.fetch(...)`. Native fetch throws "Illegal invocation" when called with
-// any `this` other than window/the realm global, so handing back the bare reference broke
-// every read in production the moment HIRO_API_KEY was unset (caught live, 2026-10-06 --
-// typecheck/build can't catch this, since it's only wrong at the call site, not the type).
-function hiroFetch(): typeof fetch {
-  const key = HIRO_API_KEY;
-  return ((url: Parameters<typeof fetch>[0], init?: RequestInit) =>
-    fetch(url, key ? { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } } : init)) as typeof fetch;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// readVaultStatus() fires 13 read-only calls at once (plus a block-height read alongside it) —
-// without a Hiro API key (unauthenticated traffic shares a 50 req/min limit across EVERY call
-// to the API, see rpc.ts in the main deepstack repo for the same concern on the backend side),
-// a burst this size can trip rate-limiting, which surfaces to the browser as a generic CORS
-// failure rather than a clear 429 (caught live, 2026-10-07 -- a real wallet, a real burst of
-// calls, all 13 failing together). Promise.all fails the WHOLE batch on any single rejection,
-// so one flaky call was taking down the entire vault-stats panel. Retrying each call
-// independently, with jittered backoff so the 13 retries desynchronize instead of re-bursting
-// in lockstep, fixes both problems without needing a second API provider.
-async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (i < attempts - 1) await sleep(800 + Math.random() * 1200 * (i + 1));
-    }
-  }
-  throw lastErr;
-}
-
-async function readOnly(contractName: string, functionName: string, args: ClarityValue[] = [], senderAddress = VAULT_ADDRESS) {
-  const result = await withRetry(() =>
+async function readOnly(contractName: string, functionName: string, args: ClarityValue[] = [], senderAddress: string = VAULT_ADDRESS): Promise<any> {
+  const result = await hiroCall(() =>
     fetchCallReadOnlyFunction({
       contractAddress: VAULT_ADDRESS,
       contractName,
@@ -55,107 +28,191 @@ async function readOnly(contractName: string, functionName: string, args: Clarit
   return cvToJSON(result);
 }
 
-// get-total-assets / get-free-balance return a bare uint (no `(ok ...)` wrapper) — every other
-// vault getter wraps its value in `(ok ...)`. Mixing these up was a real bug caught in this
-// project's own CLI tooling; kept as two distinct helpers on purpose so it can't happen here.
-const bareUint = (j: any): number => Number(j?.value ?? 0);
-const okUint = (j: any): number => Number(j?.value?.value ?? 0);
-const okInt = (j: any): number => Number(j?.value?.value ?? 0);
-const okBool = (j: any): boolean => Boolean(j?.value?.value);
-const okPrincipal = (j: any): string => String(j?.value?.value ?? "");
+// ---------------------------------------------------------------------------
+// Strict parsers over cvToJSON output
+// ---------------------------------------------------------------------------
 
-export interface VaultStatus {
-  admin: string;
-  maxTvlStx: number;
-  performanceFeeBps: number;
-  feeRecipient: string;
+function fail(what: string): never {
+  throw new Error(`unexpected response shape for ${what}`);
+}
+const uintOf = (v: any, what: string): bigint => (v?.type === "uint" ? BigInt(v.value) : fail(what));
+const intOf = (v: any, what: string): bigint => (v?.type === "int" ? BigInt(v.value) : fail(what));
+const boolOf = (v: any, what: string): boolean => (v?.type === "bool" && typeof v.value === "boolean" ? v.value : fail(what));
+const principalOf = (v: any, what: string): string => (v?.type === "principal" && typeof v.value === "string" ? v.value : fail(what));
+const okOf = (j: any, what: string): any => (j?.success === true ? j.value : fail(what));
+
+// get-total-assets / get-free-balance return a BARE uint; every other getter wraps its value
+// in (ok ...). Kept as distinct parsers on purpose: mixing them up was a real bug in this
+// project's CLI tooling.
+const bareUint = (j: any, what: string) => uintOf(j, what);
+const okUint = (j: any, what: string) => uintOf(okOf(j, what), what);
+const okInt = (j: any, what: string) => intOf(okOf(j, what), what);
+const okBool = (j: any, what: string) => boolOf(okOf(j, what), what);
+const okPrincipal = (j: any, what: string) => principalOf(okOf(j, what), what);
+
+export interface PendingChange<T> {
+  value: T;
+  executableAt: number; // stacks-block-height from which it can take effect
+}
+
+// (ok (optional { value: T, executable-at: uint }))
+function okPending<T>(j: any, what: string, valueOf: (v: any, what: string) => T): PendingChange<T> | null {
+  const opt = okOf(j, what);
+  if (typeof opt?.type !== "string" || !opt.type.startsWith("(optional")) fail(what);
+  if (opt.value === null) return null;
+  const fields = opt.value?.value;
+  if (!fields) fail(what);
+  return { value: valueOf(fields.value, what), executableAt: Number(uintOf(fields["executable-at"], what)) };
+}
+
+// ---------------------------------------------------------------------------
+// Independent multi-field reads
+// ---------------------------------------------------------------------------
+
+export interface FieldResults<T> {
+  values: Partial<T>;
+  failed: (keyof T)[];
+}
+
+async function readFields<T>(spec: { [K in keyof T]: () => Promise<T[K]> }): Promise<FieldResults<T>> {
+  const keys = Object.keys(spec) as (keyof T)[];
+  const settled = await Promise.allSettled(keys.map((k) => spec[k]()));
+  const values: Partial<T> = {};
+  const failed: (keyof T)[] = [];
+  settled.forEach((r, i) => {
+    const k = keys[i];
+    if (r.status === "fulfilled") values[k] = r.value;
+    else {
+      failed.push(k);
+      console.warn(`read failed: ${String(k)}`, r.reason);
+    }
+  });
+  return { values, failed };
+}
+
+const getter =
+  <R>(functionName: string, parse: (j: any, what: string) => R, contractName = VAULT_CONTRACT_NAME) =>
+  async (): Promise<R> =>
+    parse(await readOnly(contractName, functionName), functionName);
+
+// Amounts are base units (uSTX, or dsSTX for shares), as bigint.
+export interface VaultLive {
   depositsPaused: boolean;
   strategyPaused: boolean;
-  totalStxBalance: number; // vault-held STX, excludes capital-at-strategy
-  capitalAtStrategy: number;
-  totalAssetsStx: number; // totalStxBalance + capitalAtStrategy — what the cap applies to
-  totalPendingWithdrawals: number;
-  cumulativeRealizedPnlStx: number;
-  highWaterMarkStx: number;
-  tokenTotalSupply: number; // shares outstanding, 1:1 base units with STX
+  totalStxBalance: bigint; // STX held by the vault contract right now
+  capitalAtStrategy: bigint; // STX swept out to the strategy, counted at the amount sent
+  totalAssets: bigint; // the two above: what the cap and the share price use
+  freeBalance: bigint; // held minus reserved for accepted withdrawals: what a new request can draw on
+  totalPendingWithdrawals: bigint;
+  cumulativeRealizedPnl: bigint; // signed
+  highWaterMark: bigint; // signed
+  shareSupply: bigint;
 }
 
-export async function readVaultStatus(): Promise<VaultStatus> {
-  const [admin, maxTvl, feeBps, feeRecipient, depositsPaused, strategyPaused, totalBal, atStrategy, totalAssets, pendingWd, pnl, hwm, supply] = await Promise.all([
-    readOnly(VAULT_CONTRACT_NAME, "get-admin"),
-    readOnly(VAULT_CONTRACT_NAME, "get-max-tvl"),
-    readOnly(VAULT_CONTRACT_NAME, "get-performance-fee-bps"),
-    readOnly(VAULT_CONTRACT_NAME, "get-fee-recipient"),
-    readOnly(VAULT_CONTRACT_NAME, "get-deposits-paused"),
-    readOnly(VAULT_CONTRACT_NAME, "get-strategy-paused"),
-    readOnly(VAULT_CONTRACT_NAME, "get-total-stx-balance"),
-    readOnly(VAULT_CONTRACT_NAME, "get-capital-at-strategy"),
-    readOnly(VAULT_CONTRACT_NAME, "get-total-assets"),
-    readOnly(VAULT_CONTRACT_NAME, "get-total-pending-withdrawals"),
-    readOnly(VAULT_CONTRACT_NAME, "get-cumulative-realized-pnl"),
-    readOnly(VAULT_CONTRACT_NAME, "get-high-water-mark"),
-    readOnly(TOKEN_CONTRACT_NAME, "get-total-supply"),
-  ]);
-  return {
-    admin: okPrincipal(admin),
-    maxTvlStx: okUint(maxTvl) / 1e6,
-    performanceFeeBps: okUint(feeBps),
-    feeRecipient: okPrincipal(feeRecipient),
-    depositsPaused: okBool(depositsPaused),
-    strategyPaused: okBool(strategyPaused),
-    totalStxBalance: okUint(totalBal) / 1e6,
-    capitalAtStrategy: okUint(atStrategy) / 1e6,
-    totalAssetsStx: bareUint(totalAssets) / 1e6,
-    totalPendingWithdrawals: okUint(pendingWd) / 1e6,
-    cumulativeRealizedPnlStx: okInt(pnl) / 1e6,
-    highWaterMarkStx: okInt(hwm) / 1e6,
-    tokenTotalSupply: okUint(supply) / 1e6,
-  };
+export function readVaultLive(): Promise<FieldResults<VaultLive>> {
+  return readFields<VaultLive>({
+    depositsPaused: getter("get-deposits-paused", okBool),
+    strategyPaused: getter("get-strategy-paused", okBool),
+    totalStxBalance: getter("get-total-stx-balance", okUint),
+    capitalAtStrategy: getter("get-capital-at-strategy", okUint),
+    totalAssets: getter("get-total-assets", bareUint),
+    freeBalance: getter("get-free-balance", bareUint),
+    totalPendingWithdrawals: getter("get-total-pending-withdrawals", okUint),
+    cumulativeRealizedPnl: getter("get-cumulative-realized-pnl", okInt),
+    highWaterMark: getter("get-high-water-mark", okInt),
+    shareSupply: getter("get-total-supply", okUint, TOKEN_CONTRACT_NAME),
+  });
 }
 
-export async function readShareBalance(address: string): Promise<number> {
-  const j = await readOnly(TOKEN_CONTRACT_NAME, "get-balance", [Cl.principal(address)], address);
-  return okUint(j) / 1e6;
+// Timelocked parameters and their queued changes. These can only change after a public wait
+// of TIMELOCK_DELAY_BLOCKS, so they're read less often than VaultLive (see config.ts).
+export interface VaultSettings {
+  admin: string;
+  maxTvl: bigint;
+  performanceFeeBps: number;
+  feeRecipient: string;
+  pendingMaxTvl: PendingChange<bigint> | null;
+  pendingFeeBps: PendingChange<number> | null;
+  pendingFeeRecipient: PendingChange<string> | null;
+  pendingAdmin: PendingChange<string> | null;
+}
+
+export function readVaultSettings(): Promise<FieldResults<VaultSettings>> {
+  const bps = (v: any, what: string) => Number(uintOf(v, what));
+  return readFields<VaultSettings>({
+    admin: getter("get-admin", okPrincipal),
+    maxTvl: getter("get-max-tvl", okUint),
+    performanceFeeBps: getter("get-performance-fee-bps", (j, w) => Number(okUint(j, w))),
+    feeRecipient: getter("get-fee-recipient", okPrincipal),
+    pendingMaxTvl: getter("get-pending-max-tvl", (j, w) => okPending(j, w, uintOf)),
+    pendingFeeBps: getter("get-pending-fee-bps", (j, w) => okPending(j, w, bps)),
+    pendingFeeRecipient: getter("get-pending-fee-recipient", (j, w) => okPending(j, w, principalOf)),
+    pendingAdmin: getter("get-pending-admin", (j, w) => okPending(j, w, principalOf)),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Per-user reads
+// ---------------------------------------------------------------------------
+
+export async function readShareBalance(address: string): Promise<bigint> {
+  return okUint(await readOnly(TOKEN_CONTRACT_NAME, "get-balance", [Cl.principal(address)], address), "get-balance");
 }
 
 export interface WithdrawalRequest {
   id: number;
   owner: string;
-  shares: number;
-  lockedStxAmount: number;
+  shares: bigint; // dsSTX escrowed by the request, burned at claim
+  lockedStx: bigint; // uSTX the request is entitled to, fixed at request time
   claimableAt: number; // stacks-block-height
   claimed: boolean;
 }
 
 export async function readWithdrawalRequest(id: number): Promise<WithdrawalRequest | null> {
-  const j = await readOnly(VAULT_CONTRACT_NAME, "get-withdrawal-request", [Cl.uint(id)]);
-  const opt = j?.value; // (ok (optional (tuple ...)))
-  const tuple = opt?.value?.value;
-  if (!tuple) return null;
+  const what = `get-withdrawal-request ${id}`;
+  const opt = okOf(await readOnly(VAULT_CONTRACT_NAME, "get-withdrawal-request", [Cl.uint(id)]), what); // (optional (tuple ...))
+  if (typeof opt?.type !== "string" || !opt.type.startsWith("(optional")) fail(what);
+  if (opt.value === null) return null;
+  const t = opt.value?.value;
+  if (!t) fail(what);
   return {
     id,
-    owner: String(tuple.owner?.value ?? ""),
-    shares: Number(tuple.shares?.value ?? 0) / 1e6,
-    lockedStxAmount: Number(tuple["locked-stx-amount"]?.value ?? 0) / 1e6,
-    claimableAt: Number(tuple["claimable-at"]?.value ?? 0),
-    claimed: Boolean(tuple.claimed?.value),
+    owner: principalOf(t.owner, what),
+    shares: uintOf(t.shares, what),
+    lockedStx: uintOf(t["locked-stx-amount"], what),
+    claimableAt: Number(uintOf(t["claimable-at"], what)),
+    claimed: boolOf(t.claimed, what),
   };
 }
 
+// ---------------------------------------------------------------------------
+// Chain state
+// ---------------------------------------------------------------------------
+
 export async function readCurrentBlockHeight(): Promise<number> {
-  return withRetry(async () => {
-    const res = await hiroFetch()(`${HIRO_API_BASE}/v2/info`);
-    if (!res.ok) throw new Error(`/v2/info failed: ${res.status}`);
-    const j = await res.json();
-    return Number(j.stacks_tip_height ?? 0);
-  });
+  const h = Number((await hiroGetJson(HIRO_API_BASE, "/v2/info"))?.stacks_tip_height);
+  if (!(h > 0)) throw new Error("/v2/info returned no stacks_tip_height");
+  return h;
 }
 
 export async function readNetworkId(): Promise<number> {
-  return withRetry(async () => {
-    const res = await hiroFetch()(`${HIRO_API_BASE}/v2/info`);
-    if (!res.ok) throw new Error(`/v2/info failed: ${res.status}`);
-    const j = await res.json();
-    return Number(j.network_id ?? 0);
-  });
+  const id = Number((await hiroGetJson(HIRO_API_BASE, "/v2/info"))?.network_id);
+  if (!Number.isFinite(id)) throw new Error("/v2/info returned no network_id");
+  return id;
+}
+
+// Real seconds per block over the most recent `window` blocks, from the chain's own block
+// timestamps (two requests). Every duration shown to a user is a block count converted with
+// this, never a fixed assumption. The contract was sized for 15.25 s/block; mainnet ran at
+// 13.38 over withdrawal #0's delay (see config.ts).
+export async function measureSecPerBlock(window: number): Promise<number> {
+  const latest = (await hiroGetJson(HIRO_API_BASE, "/extended/v2/blocks?limit=1"))?.results?.[0];
+  const tipHeight = Number(latest?.height);
+  const tipTime = Number(latest?.block_time);
+  if (!(tipHeight > window) || !(tipTime > 0)) throw new Error("couldn't read the latest block");
+  const pastTime = Number((await hiroGetJson(HIRO_API_BASE, `/extended/v2/blocks/${tipHeight - window}`))?.block_time);
+  if (!(pastTime > 0)) throw new Error("couldn't read a past block's time");
+  const secPerBlock = (tipTime - pastTime) / window;
+  if (!(secPerBlock >= 2 && secPerBlock <= 120)) throw new Error(`implausible block pace: ${secPerBlock}`);
+  return secPerBlock;
 }

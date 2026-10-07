@@ -1,17 +1,8 @@
 // Poll the Hiro API for a broadcast transaction's confirmation + parsed Clarity return value.
-// No websocket/backend — plain polling, same pattern this project's own CLI tooling uses.
+// No websocket/backend: plain polling, same pattern this project's own CLI tooling uses.
 
-import { HIRO_API_BASE, HIRO_API_KEY } from "./config";
-
-// Same fix as reads.ts's hiroFetch() -- always wrap, never hand back the bare native `fetch`
-// reference. This file's own call sites happen to call it as a free function (safe either
-// way), but keeping both copies identical means that stops being true by accident if either
-// ever changes.
-function hiroFetch(): typeof fetch {
-  const key = HIRO_API_KEY;
-  return ((url: Parameters<typeof fetch>[0], init?: RequestInit) =>
-    fetch(url, key ? { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } } : init)) as typeof fetch;
-}
+import { HIRO_API_BASE } from "./config";
+import { hiroFetch } from "./hiro";
 
 export interface TxOutcome {
   status: "success" | "abort_by_response" | "abort_by_post_condition" | "timeout" | string;
@@ -32,7 +23,7 @@ export async function waitForTx(txid: string, onTick?: (attempt: number) => void
         return { status: j.tx_status, repr: j.tx_result?.repr };
       }
     } catch {
-      // transient — keep polling rather than failing on one bad poll
+      // transient (including a per-request timeout): keep polling rather than fail on one bad poll
     }
   }
   return { status: "timeout" };
