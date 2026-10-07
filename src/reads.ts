@@ -16,16 +16,42 @@ function hiroFetch(): typeof fetch {
     fetch(url, key ? { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), "x-api-key": key } } : init)) as typeof fetch;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// readVaultStatus() fires 13 read-only calls at once (plus a block-height read alongside it) —
+// without a Hiro API key (unauthenticated traffic shares a 50 req/min limit across EVERY call
+// to the API, see rpc.ts in the main deepstack repo for the same concern on the backend side),
+// a burst this size can trip rate-limiting, which surfaces to the browser as a generic CORS
+// failure rather than a clear 429 (caught live, 2026-10-07 -- a real wallet, a real burst of
+// calls, all 13 failing together). Promise.all fails the WHOLE batch on any single rejection,
+// so one flaky call was taking down the entire vault-stats panel. Retrying each call
+// independently, with jittered backoff so the 13 retries desynchronize instead of re-bursting
+// in lockstep, fixes both problems without needing a second API provider.
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await sleep(800 + Math.random() * 1200 * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
 async function readOnly(contractName: string, functionName: string, args: ClarityValue[] = [], senderAddress = VAULT_ADDRESS) {
-  const result = await fetchCallReadOnlyFunction({
-    contractAddress: VAULT_ADDRESS,
-    contractName,
-    functionName,
-    functionArgs: args,
-    network: "mainnet",
-    senderAddress,
-    client: { baseUrl: HIRO_API_BASE, fetch: hiroFetch() },
-  });
+  const result = await withRetry(() =>
+    fetchCallReadOnlyFunction({
+      contractAddress: VAULT_ADDRESS,
+      contractName,
+      functionName,
+      functionArgs: args,
+      network: "mainnet",
+      senderAddress,
+      client: { baseUrl: HIRO_API_BASE, fetch: hiroFetch() },
+    }),
+  );
   return cvToJSON(result);
 }
 
@@ -117,15 +143,19 @@ export async function readWithdrawalRequest(id: number): Promise<WithdrawalReque
 }
 
 export async function readCurrentBlockHeight(): Promise<number> {
-  const res = await hiroFetch()(`${HIRO_API_BASE}/v2/info`);
-  if (!res.ok) throw new Error(`/v2/info failed: ${res.status}`);
-  const j = await res.json();
-  return Number(j.stacks_tip_height ?? 0);
+  return withRetry(async () => {
+    const res = await hiroFetch()(`${HIRO_API_BASE}/v2/info`);
+    if (!res.ok) throw new Error(`/v2/info failed: ${res.status}`);
+    const j = await res.json();
+    return Number(j.stacks_tip_height ?? 0);
+  });
 }
 
 export async function readNetworkId(): Promise<number> {
-  const res = await hiroFetch()(`${HIRO_API_BASE}/v2/info`);
-  if (!res.ok) throw new Error(`/v2/info failed: ${res.status}`);
-  const j = await res.json();
-  return Number(j.network_id ?? 0);
+  return withRetry(async () => {
+    const res = await hiroFetch()(`${HIRO_API_BASE}/v2/info`);
+    if (!res.ok) throw new Error(`/v2/info failed: ${res.status}`);
+    const j = await res.json();
+    return Number(j.network_id ?? 0);
+  });
 }
