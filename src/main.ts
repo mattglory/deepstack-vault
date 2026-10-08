@@ -413,7 +413,7 @@ const CONSENT_ITEMS: { key: keyof typeof consent; label: string }[] = [
   },
   {
     key: "fee",
-    label: "DeepStack charges a performance fee only on realized gains above the vault's own all-time high — never on deposits, never on paper gains, never on losses.",
+    label: "DeepStack charges a performance fee only when realized gains take the vault as a whole above its previous high, never on deposits or paper gains. The high is tracked for the whole vault, not per depositor, so I could pay part of a fee while still below my own entry value.",
   },
   {
     key: "jurisdiction",
