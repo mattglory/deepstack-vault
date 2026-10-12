@@ -2,7 +2,7 @@
   "name": "deepstack-vault-app",
   "version": "0.1.0",
   "private": true,
-  "description": "Third-party deposit frontend for the DeepStack vault (deepstack-vault.clar) on Stacks mainnet.",
+  "description": "Deposit frontend for the DeepStack vault v2 (deepstack-vault-v2.clar). Builds for testnet by default.",
   "type": "module",
   "scripts": {
     "dev": "vite",

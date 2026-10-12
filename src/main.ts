@@ -1,83 +1,66 @@
 import "./style.css";
 import {
-  VAULT_ADDRESS,
-  VAULT_CONTRACT_NAME,
-  WITHDRAWAL_DELAY_BLOCKS,
-  TIMELOCK_DELAY_BLOCKS,
-  FALLBACK_SEC_PER_BLOCK,
-  LIVE_REFRESH_MS,
-  SETTINGS_REFRESH_MS,
-  PACE_REFRESH_MS,
-  MIN_FIRST_DEPOSIT,
+  NETWORK, VAULT_CONTRACT_ID, MAX_EPOCH_BURN, TIMELOCK_BURN, WITHDRAWAL_DELAY_BURN, SEC_PER_BURN_BLOCK,
+  REFRESH_MS, EPOCH_SCAN, EXPECTED_NETWORK_ID, EXPLORER_TX, STX_DECIMALS, SHARE_DECIMALS,
 } from "./config";
 import {
-  readVaultLive,
-  readVaultSettings,
-  readShareBalance,
-  readWithdrawalRequest,
-  readCurrentBlockHeight,
-  measureSecPerBlock,
-  type FieldResults,
-  type PendingChange,
-  type VaultLive,
-  type VaultSettings,
-  type WithdrawalRequest,
+  readState, readPendingChanges, readShareBalance, readRequest, readEpoch, readEpochDeposit, readEpochWithdrawal,
+  readChainInfo, type VaultState, type PendingChange, type IdleRequest, type Epoch,
 } from "./reads";
-import { connectWallet, disconnectWallet, getConnectedAddress, verifyMainnet } from "./wallet";
-import { depositStx, requestWithdrawal, claimWithdrawal } from "./writes";
-import { waitForTx, parseOkUintRepr } from "./tx";
-import { rememberWithdrawalId, getKnownWithdrawalIds } from "./known-withdrawals";
-import { recordHistoryPoint, getHistory } from "./history";
-import { assetsForShares, sharesForDeposit, maxSharesWithinLiquidity, parseAmount, fmtStx, microToNumber, microToInput } from "./math";
+import { connectWallet, disconnectWallet, getConnectedAddress, addressMatchesNetwork } from "./wallet";
+import {
+  deposit, requestWithdrawal, claimIdle, claimEpochDeposit, claimEpochWithdrawal, cancelDeposit, cancelWithdrawal,
+  settleOverdue, type TxResult,
+} from "./writes";
+import { waitForTx, parseRequestRepr } from "./tx";
+import { rememberRequest, forgetRequest, rememberEpoch, knownRequests, knownEpochs } from "./known-withdrawals";
+import { sharesForAssets, assetsForShares, parseUnits, toInput, fmtStx, fmtShares, fmtPrice } from "./math";
 
 // ---------------------------------------------------------------------------
-// State
+// State. A value is only replaced by a successful read; a failed read keeps the last good value
+// and marks it stale. Never-read values are undefined and render as "unavailable", never as 0.
 // ---------------------------------------------------------------------------
 
 let address: string | null = getConnectedAddress();
-let networkOk: boolean | null = null; // null = not verified yet; retried on every refresh
-
-// Last GOOD value per field. A field is only overwritten by a successful read; a failed read
-// keeps the previous value and marks it stale. A never-read field is undefined and renders as
-// "unavailable", never as 0.
-let live: Partial<VaultLive> = {};
-let settings: Partial<VaultSettings> = {};
+let networkOk: boolean | null = null; // the API's network_id matches this build
+let vs: VaultState | undefined;
+let currentEpoch: Epoch | null | undefined; // the open epoch's record, null when idle
+let pending: PendingChange[] | undefined;
+let burnHeight: bigint | undefined;
 let shareBalance: bigint | undefined;
-let blockHeight: number | undefined;
-let knownWithdrawals: WithdrawalRequest[] = [];
-const stale = new Set<string>(); // keys ("live.freeBalance", ...) whose most recent read failed
+let requests: IdleRequest[] = [];
+interface EpochItem { e: bigint; ep: Epoch; dep: bigint; wd: bigint }
+let epochItems: EpochItem[] = [];
+const stale = new Set<string>();
 let lastRefreshAt: number | null = null;
-let nextSettingsAt = 0;
-let nextPaceAt = 0;
-let secPerBlock = FALLBACK_SEC_PER_BLOCK;
-let paceMeasured = false;
 
-let lookupResult: WithdrawalRequest | "not-found" | "error" | null = null;
+// Settled epochs never change, and a settled epoch in which this user has nothing can never gain
+// anything (nobody can queue into a settled epoch). Both are cached so the per-refresh scan only
+// re-reads what can still move. Keyed by address for the empty set.
+const settledEpochCache = new Map<string, Epoch>();
+const emptySettled = new Set<string>();
 
-const consent = { custody: false, audit: false, cap: false, withdrawal: false, fee: false, jurisdiction: false };
+let lookupResult: IdleRequest | "not-found" | "error" | null = null;
+let busy = false;
+let draftDeposit = "";
+let draftWithdraw = "";
+let draftLookup = "";
+
+const consent = { strategy: false, audit: false, timing: false, fee: false, testnet: false, jurisdiction: false };
 const consentAllChecked = () => Object.values(consent).every(Boolean);
 
-let busy = false; // true while a tx is broadcasting/confirming; disables the action buttons
-
-// Draft values for the free-text inputs, held in state rather than read back from the DOM.
-// Every refresh rebuilds each panel's innerHTML, so without this a user mid-typing would see
-// their input wiped. Restored as each input's `value` on render.
-let draftDepositAmount = "";
-let draftWithdrawShares = "";
-let draftLookupId = "";
-
-// Non-blocking status banner (a broadcast can take minutes to confirm, so no alert()).
 type StatusKind = "info" | "success" | "error";
-let status: { message: string; kind: StatusKind; loadError: boolean } | null = null;
-function setStatus(message: string, kind: StatusKind, loadError = false): void {
-  status = { message, kind, loadError };
+let status: { html: string; kind: StatusKind; loadError: boolean } | null = null;
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+function setStatus(message: string, kind: StatusKind, loadError = false, txid?: string): void {
+  const link = txid ? ` <a href="${EXPLORER_TX(txid)}" target="_blank" rel="noopener">view transaction</a>` : "";
+  status = { html: escapeHtml(message) + link, kind, loadError };
   renderStatusBanner();
 }
 function clearStatus(): void {
   status = null;
   renderStatusBanner();
 }
-const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 function renderStatusBanner(): void {
   const el = document.getElementById("status-banner");
   if (!el) return;
@@ -88,121 +71,128 @@ function renderStatusBanner(): void {
   }
   el.hidden = false;
   el.className = `status-banner ${status.kind}`;
-  el.innerHTML = `<span>${escapeHtml(status.message)}</span><button class="secondary" id="btn-dismiss-status">Dismiss</button>`;
+  el.innerHTML = `<span>${status.html}</span><button class="secondary" id="btn-dismiss-status">Dismiss</button>`;
   document.getElementById("btn-dismiss-status")!.addEventListener("click", clearStatus);
 }
 
 // ---------------------------------------------------------------------------
-// Formatting helpers
+// Formatting
 // ---------------------------------------------------------------------------
 
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 const yesNo = (b: boolean) => (b ? "yes" : "no");
-const pct = (bps: number) => `${(bps / 100).toFixed(1)}%`;
-const stx0 = (v: bigint) => `${fmtStx(v, 0)} STX`;
+const pct = (bps: bigint) => `${(Number(bps) / 100).toFixed(1)}%`;
+const stx = (u: bigint, dp = 6) => `${fmtStx(u, dp)} STX`;
 
-// Block counts are the only thing the contract enforces. Real time per block drifts, so every
-// duration is converted with the live-measured pace (see measureSecPerBlock), never a constant.
-function blocksToDuration(blocks: number): string {
-  const secs = blocks * secPerBlock;
+// Delays are enforced in Bitcoin (burn) blocks. Times are a rough guide only.
+function burnToDuration(blocks: bigint | number): string {
+  const secs = Number(blocks) * SEC_PER_BURN_BLOCK;
   if (secs >= 86_400) return `about ${(secs / 86_400).toFixed(1)} days`;
   if (secs >= 3_600) return `about ${(secs / 3_600).toFixed(1)} hours`;
   return `about ${Math.max(1, Math.round(secs / 60))} minutes`;
 }
+const blocksText = (n: number) => `${n.toLocaleString()} Bitcoin blocks, ${burnToDuration(n)}`;
 
 const UNAVAILABLE = `<span class="unavailable">unavailable</span>`;
 const STALE_TITLE = "Couldn't refresh this just now. Showing the last good reading.";
 function show<T>(value: T | undefined, key: string, format: (v: T) => string): string {
   if (value === undefined) return UNAVAILABLE;
-  if (stale.has(key)) return `<span class="stale" title="${STALE_TITLE}">${format(value)}</span>`;
-  return format(value);
+  return stale.has(key) ? `<span class="stale" title="${STALE_TITLE}">${format(value)}</span>` : format(value);
 }
 
 // ---------------------------------------------------------------------------
 // Data loading
 // ---------------------------------------------------------------------------
 
-function applyFields<T>(target: Partial<T>, res: FieldResults<T>, prefix: string): void {
-  for (const k of Object.keys(res.values) as (keyof T)[]) {
-    target[k] = res.values[k];
-    stale.delete(`${prefix}.${String(k)}`);
-  }
-  for (const k of res.failed) stale.add(`${prefix}.${String(k)}`);
+async function epochCached(e: bigint): Promise<Epoch | null> {
+  const k = e.toString();
+  const hit = settledEpochCache.get(k);
+  if (hit) return hit;
+  const ep = await readEpoch(e);
+  if (ep?.settled) settledEpochCache.set(k, ep);
+  return ep;
 }
 
-async function readKnownWithdrawals(who: string): Promise<WithdrawalRequest[]> {
-  const ids = getKnownWithdrawalIds(who);
-  const results = await Promise.allSettled(ids.map((id) => readWithdrawalRequest(id)));
+// The contract has no per-user index, so scan the most recent epochs plus any this browser saw
+// the user queue into. Throws if any read fails, so the caller keeps the previous list.
+async function scanEpochs(who: string, cur: bigint): Promise<EpochItem[]> {
+  const ids = new Set<bigint>(knownEpochs(who));
+  for (let e = cur; e >= 0n && e > cur - BigInt(EPOCH_SCAN); e--) ids.add(e);
+  const out: EpochItem[] = [];
+  await Promise.all(
+    [...ids].map(async (e) => {
+      const ek = `${who}:${e}`;
+      if (emptySettled.has(ek)) return;
+      const [dep, wd] = await Promise.all([readEpochDeposit(e, who), readEpochWithdrawal(e, who)]);
+      if (dep === 0n && wd === 0n) {
+        // Every epoch below the current id has settled (the id only advances on settlement).
+        if (e < cur) emptySettled.add(ek);
+        return;
+      }
+      const ep = await epochCached(e);
+      if (ep) out.push({ e, ep, dep, wd });
+    }),
+  );
+  return out.sort((a, b) => (a.e < b.e ? 1 : -1));
+}
+
+async function readKnownRequests(who: string): Promise<IdleRequest[]> {
+  const ids = knownRequests(who);
+  const results = await Promise.allSettled(ids.map((id) => readRequest(id)));
   return ids.flatMap((id, i) => {
     const r = results[i];
-    if (r.status === "fulfilled") return r.value && r.value.owner === who ? [r.value] : [];
-    const prev = knownWithdrawals.find((w) => w.id === id && w.owner === who); // keep the last good reading
+    if (r.status === "fulfilled") {
+      if (!r.value) forgetRequest(who, id); // claimed: the contract deletes the record
+      return r.value && r.value.owner === who ? [r.value] : [];
+    }
+    const prev = requests.find((w) => w.id === id);
     return prev ? [prev] : [];
   });
 }
 
 async function doRefresh(): Promise<void> {
-  const now = Date.now();
-  const who = address; // snapshot: a disconnect mid-refresh must not write this user's data back
-  const wantSettings = now >= nextSettingsAt;
-  const wantPace = now >= nextPaceAt;
-  const wantNetwork = who !== null && networkOk === null;
+  const who = address; // a disconnect mid-refresh must not write this user's data back
+  const [stateR, pendingR, chainR] = await Promise.allSettled([readState(), readPendingChanges(), readChainInfo()]);
 
-  const [liveR, settingsR, heightR, balanceR, withdrawalsR, paceR, netR] = await Promise.allSettled([
-    readVaultLive(),
-    wantSettings ? readVaultSettings() : Promise.resolve(null),
-    readCurrentBlockHeight(),
+  if (stateR.status === "fulfilled") {
+    vs = stateR.value;
+    stale.delete("state");
+  } else stale.add("state");
+  if (pendingR.status === "fulfilled") {
+    pending = pendingR.value;
+    stale.delete("pending");
+  } else stale.add("pending");
+  if (chainR.status === "fulfilled") {
+    burnHeight = chainR.value.burnHeight;
+    networkOk = chainR.value.networkId === EXPECTED_NETWORK_ID;
+    stale.delete("chain");
+  } else stale.add("chain");
+
+  const [epR, balR, reqR, scanR] = await Promise.allSettled([
+    vs?.epochOpen ? readEpoch(vs.currentEpoch) : Promise.resolve(null),
     who ? readShareBalance(who) : Promise.resolve(undefined),
-    who ? readKnownWithdrawals(who) : Promise.resolve([] as WithdrawalRequest[]),
-    wantPace ? measureSecPerBlock(WITHDRAWAL_DELAY_BLOCKS) : Promise.resolve(null),
-    wantNetwork ? verifyMainnet() : Promise.resolve(null),
+    who ? readKnownRequests(who) : Promise.resolve([] as IdleRequest[]),
+    who && vs ? scanEpochs(who, vs.currentEpoch) : Promise.resolve(undefined),
   ]);
-
-  if (liveR.status === "fulfilled") applyFields(live, liveR.value, "live");
-
-  if (wantSettings && settingsR.status === "fulfilled" && settingsR.value) {
-    applyFields(settings, settingsR.value, "settings");
-    // Fully read: wait the normal interval. Partly failed: retry on the very next refresh.
-    nextSettingsAt = settingsR.value.failed.length === 0 ? now + SETTINGS_REFRESH_MS : 0;
-  }
-
-  if (heightR.status === "fulfilled") {
-    blockHeight = heightR.value;
-    stale.delete("chain.blockHeight");
-  } else stale.add("chain.blockHeight");
-
+  if (epR.status === "fulfilled") currentEpoch = epR.value;
   if (who !== null && who === address) {
-    if (balanceR.status === "fulfilled" && balanceR.value !== undefined) {
-      shareBalance = balanceR.value;
-      stale.delete("user.shareBalance");
-    } else if (balanceR.status === "rejected") stale.add("user.shareBalance");
-    if (withdrawalsR.status === "fulfilled") knownWithdrawals = withdrawalsR.value;
-    if (wantNetwork && netR.status === "fulfilled" && netR.value) networkOk = netR.value.ok;
+    if (balR.status === "fulfilled" && balR.value !== undefined) {
+      shareBalance = balR.value;
+      stale.delete("user.shares");
+    } else if (balR.status === "rejected") stale.add("user.shares");
+    if (reqR.status === "fulfilled") requests = reqR.value;
+    if (scanR.status === "fulfilled" && scanR.value !== undefined) {
+      epochItems = scanR.value;
+      stale.delete("user.epochs");
+    } else if (scanR.status === "rejected") stale.add("user.epochs");
   }
 
-  if (wantPace) {
-    if (paceR.status === "fulfilled" && paceR.value !== null) {
-      secPerBlock = paceR.value;
-      paceMeasured = true;
-      nextPaceAt = now + PACE_REFRESH_MS;
-    } else nextPaceAt = now + SETTINGS_REFRESH_MS; // retry in a few minutes, not on every poll
-  }
-
-  lastRefreshAt = now;
-  const { cumulativeRealizedPnl: pnl, highWaterMark: hwm } = live;
-  if (pnl !== undefined && hwm !== undefined && !stale.has("live.cumulativeRealizedPnl") && !stale.has("live.highWaterMark")) {
-    recordHistoryPoint(microToNumber(pnl), microToNumber(hwm));
-  }
-
-  if (Object.keys(live).length === 0 && Object.keys(settings).length === 0) {
-    setStatus("Couldn't reach the Stacks API to load vault data. This happens intermittently. Retrying automatically.", "error", true);
-  } else if (status?.loadError) clearStatus();
-
+  lastRefreshAt = Date.now();
+  if (vs === undefined) setStatus("Couldn't reach the Stacks API to load vault data. This happens intermittently. Retrying automatically.", "error", true);
+  else if (status?.loadError) clearStatus();
   renderAll();
 }
 
-// One refresh at a time. A refresh requested while one is running (background poll plus a
-// post-transaction refresh) runs once more right after it, so nothing is silently skipped.
 let refreshInFlight: Promise<void> | null = null;
 let rerunRequested = false;
 function refreshAll(): Promise<void> {
@@ -226,8 +216,10 @@ function refreshAll(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Wallet area
+// Wallet
 // ---------------------------------------------------------------------------
+
+const walletOk = () => address !== null && networkOk !== false && addressMatchesNetwork(address);
 
 function renderWalletArea(): void {
   const el = document.getElementById("wallet-area")!;
@@ -236,15 +228,17 @@ function renderWalletArea(): void {
     document.getElementById("btn-connect")!.addEventListener("click", onConnect);
     return;
   }
-  const netBadge = networkOk === false ? `<span class="badge bad">wrong network</span>` : networkOk === true ? `<span class="badge ok">mainnet</span>` : "";
-  el.innerHTML = `<span class="muted">${shortAddr(address)}</span> ${netBadge} <button class="secondary" id="btn-disconnect">Disconnect</button>`;
+  const badge = !addressMatchesNetwork(address) || networkOk === false ? `<span class="badge bad">wrong network</span>` : `<span class="badge ok">${NETWORK}</span>`;
+  el.innerHTML = `<span class="muted">${shortAddr(address)}</span> ${badge} <button class="secondary" id="btn-disconnect">Disconnect</button>`;
   document.getElementById("btn-disconnect")!.addEventListener("click", onDisconnect);
 }
 
 function resetUserState(): void {
   shareBalance = undefined;
-  knownWithdrawals = [];
-  stale.delete("user.shareBalance");
+  requests = [];
+  epochItems = [];
+  stale.delete("user.shares");
+  stale.delete("user.epochs");
   lookupResult = null;
 }
 
@@ -256,91 +250,110 @@ async function onConnect(): Promise<void> {
     return;
   }
   resetUserState();
-  networkOk = null; // verified by the refresh below, and retried until it succeeds
   await refreshAll();
 }
 
 async function onDisconnect(): Promise<void> {
   await disconnectWallet();
   address = null;
-  networkOk = null;
   resetUserState();
   renderAll();
 }
 
-// ---------------------------------------------------------------------------
-// Vault stats (public)
-// ---------------------------------------------------------------------------
-
-function paceLine(): string {
-  return paceMeasured
-    ? `Times assume ${secPerBlock.toFixed(1)} seconds per block, measured over the last ${WITHDRAWAL_DELAY_BLOCKS.toLocaleString()} blocks.`
-    : `Times assume ${secPerBlock.toFixed(1)} seconds per block, an earlier measurement, until a live one loads.`;
+function renderNetworkBanner(): void {
+  const el = document.getElementById("network-banner")!;
+  if (NETWORK === "testnet") {
+    el.hidden = false;
+    el.textContent = "Testnet build. Testnet STX has no value. This page talks to the testnet deployment of vault v2 only.";
+  } else el.hidden = true;
 }
 
-function updatedLine(): string {
-  if (lastRefreshAt === null) return "";
-  const t = new Date(lastRefreshAt).toLocaleTimeString();
-  const n = stale.size;
-  return n === 0 ? `Updated ${t}.` : `Updated ${t}. ${n} value${n === 1 ? "" : "s"} couldn't be refreshed and show the last good reading, underlined.`;
+// ---------------------------------------------------------------------------
+// Vault status (public)
+// ---------------------------------------------------------------------------
+
+function phaseHtml(s: VaultState): string {
+  if (!s.initialized) return `<span class="phase">not initialized yet</span>`;
+  if (!s.epochOpen) return `<span class="phase idle">IDLE</span>`;
+  return `<span class="phase deployed">DEPLOYED, epoch ${s.currentEpoch}</span>`;
+}
+
+function epochDeadlineHtml(s: VaultState): string {
+  if (!s.epochOpen || !currentEpoch) return "";
+  const due = currentEpoch.startBurn + BigInt(MAX_EPOCH_BURN);
+  const left = burnHeight !== undefined ? due - burnHeight : undefined;
+  const when = s.overdue
+    ? `<span class="notice bad">overdue now</span>`
+    : left !== undefined && left > 0n
+      ? `Bitcoin block ${due.toLocaleString()}, in ${burnToDuration(left)}`
+      : `Bitcoin block ${due.toLocaleString()}`;
+  return `
+    <div class="stat-row"><span class="label">Deployed this epoch</span><span>${stx(currentEpoch.deployed, 2)}</span></div>
+    <div class="stat-row"><span class="label">Must return by</span><span>${when}</span></div>`;
 }
 
 function renderVaultStats(): void {
   const el = document.getElementById("vault-stats-body")!;
-  document.getElementById("vault-addr-footer")!.textContent = `${VAULT_ADDRESS}.${VAULT_CONTRACT_NAME}`;
+  document.getElementById("vault-addr-footer")!.textContent = VAULT_CONTRACT_ID;
   if (lastRefreshAt === null) {
     el.innerHTML = `<div class="skeleton">loading…</div>`;
     return;
   }
-  const { totalAssets, capitalAtStrategy, freeBalance, depositsPaused, strategyPaused } = live;
-  const { maxTvl, performanceFeeBps, admin } = settings;
-  const capKnown = totalAssets !== undefined && maxTvl !== undefined && maxTvl > 0n;
-  const fillPct = capKnown ? Math.min(100, (microToNumber(totalAssets) / microToNumber(maxTvl)) * 100) : 0;
-  const full = capKnown && totalAssets >= maxTvl;
+  const s = vs;
+  if (!s) {
+    el.innerHTML = `<p class="notice bad">Vault data unavailable. Retrying automatically.</p>`;
+    return;
+  }
+  const k = "state";
+  const committed = s.totalAssets + s.pendingDeposits;
+  const fillPct = s.maxTvl > 0n ? Math.min(100, (Number(committed) / Number(s.maxTvl)) * 100) : 0;
+  const floor = (s.sweepRefPps * 9n) / 10n;
+  const overdueBtn = s.epochOpen && s.overdue
+    ? `<p class="notice bad">This epoch passed its ${MAX_EPOCH_BURN}-block deadline without the strategy returning capital. Anyone can now settle it as a write-off: queued deposits become 1:1 refunds and queued withdrawals get their shares back.</p>
+       <button class="secondary" id="btn-settle-overdue" ${walletOk() && !busy ? "" : "disabled"}>Settle overdue epoch</button>`
+    : "";
   el.innerHTML = `
-    <div class="stat-row"><span class="label">Phase 1 cap</span><span>${show(totalAssets, "live.totalAssets", (v) => fmtStx(v, 2))} / ${show(maxTvl, "settings.maxTvl", (v) => fmtStx(v, 0))} STX</span></div>
-    <div class="cap-bar"><div class="cap-bar-fill ${full ? "full" : ""}" style="width:${fillPct}%"></div></div>
-    <div class="stat-row"><span class="label">Deployed to the strategy</span><span>${show(capitalAtStrategy, "live.capitalAtStrategy", (v) => `${fmtStx(v, 2)} STX`)}</span></div>
-    <div class="stat-row"><span class="label">Free for new withdrawal requests</span><span>${show(freeBalance, "live.freeBalance", (v) => `${fmtStx(v, 2)} STX`)}</span></div>
-    <div class="stat-row"><span class="label">Performance fee</span><span>${show(performanceFeeBps, "settings.performanceFeeBps", pct)}</span></div>
-    <div class="stat-row"><span class="label">Admin</span><span>${show(admin, "settings.admin", shortAddr)}</span></div>
-    <div class="stat-row"><span class="label">Deposits paused</span><span>${show(depositsPaused, "live.depositsPaused", yesNo)}</span></div>
-    <div class="stat-row"><span class="label">Strategy sweeps paused</span><span>${show(strategyPaused, "live.strategyPaused", yesNo)}</span></div>
-    <div class="stat-row"><span class="label">Withdrawal delay</span><span>${WITHDRAWAL_DELAY_BLOCKS.toLocaleString()} blocks, ${blocksToDuration(WITHDRAWAL_DELAY_BLOCKS)}</span></div>
-    <div class="stat-row"><span class="label">Notice before an admin change</span><span>${TIMELOCK_DELAY_BLOCKS.toLocaleString()} blocks, ${blocksToDuration(TIMELOCK_DELAY_BLOCKS)}</span></div>
-    <div class="stat-row"><span class="label">Audit status</span><span>internal review + 60-test suite — no professional audit yet</span></div>
-    <p class="updated">${paceLine()} ${updatedLine()}</p>
+    <div class="stat-row"><span class="label">Phase</span><span>${show(s, k, phaseHtml)}</span></div>
+    ${epochDeadlineHtml(s)}
+    <div class="stat-row"><span class="label">Pilot cap (includes queued deposits)</span><span>${show(s, k, () => `${fmtStx(committed, 2)} / ${fmtStx(s.maxTvl, 0)} STX`)}</span></div>
+    <div class="cap-bar"><div class="cap-bar-fill ${committed >= s.maxTvl ? "full" : ""}" style="width:${fillPct}%"></div></div>
+    <div class="stat-row"><span class="label">Share price</span><span>${show(s, k, () => `${fmtPrice(s.pps)} STX`)}</span></div>
+    <div class="stat-row"><span class="label">Fee high-water mark</span><span>${show(s, k, () => `${fmtPrice(s.hwmPps)} STX`)}</span></div>
+    <div class="stat-row"><span class="label">Sweeps blocked below</span><span>${show(s, k, () => `${fmtPrice(floor)} STX`)}</span></div>
+    <div class="stat-row"><span class="label">Vault assets</span><span>${show(s, k, () => stx(s.totalAssets, 2))}</span></div>
+    <div class="stat-row"><span class="label">At the strategy now</span><span>${show(s, k, () => stx(s.capitalAtStrategy, 2))}</span></div>
+    <div class="stat-row"><span class="label">Queued deposits / reserved for claims</span><span>${show(s, k, () => `${fmtStx(s.pendingDeposits, 2)} / ${fmtStx(s.ringfenced, 2)} STX`)}</span></div>
+    <div class="stat-row"><span class="label">Realized P&amp;L, all epochs</span><span>${show(s, k, () => stx(s.realizedPnl, 6))}</span></div>
+    <div class="stat-row"><span class="label">Performance fee</span><span>${show(s, k, () => pct(s.feeBps))}</span></div>
+    <div class="stat-row"><span class="label">Most the admin can sweep</span><span>${show(s, k, () => `${pct(s.maxDeployBps)} of vault assets`)}</span></div>
+    <div class="stat-row"><span class="label">Deposits paused / sweeps paused</span><span>${show(s, k, () => `${yesNo(s.depositsPaused)} / ${yesNo(s.sweepsPaused)}`)}</span></div>
+    <div class="stat-row"><span class="label">Admin</span><span>${show(s, k, () => shortAddr(s.admin))}</span></div>
+    <div class="stat-row"><span class="label">Strategy</span><span>${show(s, k, () => shortAddr(s.strategy))}</span></div>
+    <div class="stat-row"><span class="label">Guardian (pause only)</span><span>${show(s, k, () => shortAddr(s.guardian))}</span></div>
+    <div class="stat-row"><span class="label">Idle withdrawal delay</span><span>${blocksText(WITHDRAWAL_DELAY_BURN)}</span></div>
+    <div class="stat-row"><span class="label">Longest an epoch can run</span><span>${blocksText(MAX_EPOCH_BURN)}</span></div>
+    <div class="stat-row"><span class="label">Notice before an admin change</span><span>${blocksText(TIMELOCK_BURN)}</span></div>
+    ${overdueBtn}
+    <p class="updated">Times are approximate (about ${Math.round(SEC_PER_BURN_BLOCK / 60)} minutes per Bitcoin block on ${NETWORK}). ${lastRefreshAt ? `Updated ${new Date(lastRefreshAt).toLocaleTimeString()}.` : ""}${stale.size ? " Some values couldn't be refreshed and show the last good reading, underlined." : ""}</p>
   `;
+  document.getElementById("btn-settle-overdue")?.addEventListener("click", () =>
+    runTx("Settling the overdue epoch", () => settleOverdue(), () => "Overdue epoch settled."),
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Queued admin changes (public). The timelock only protects a depositor who can SEE a change
-// coming, so every queued change the contract holds is shown here with its countdown.
+// Queued admin changes (public)
 // ---------------------------------------------------------------------------
 
-interface PendingView {
-  label: string;
-  change: PendingChange<string> | null | undefined; // undefined = couldn't be read
-  current: string;
-  appliedBy: string;
-}
-
-function formatPending<T>(p: PendingChange<T> | null | undefined, f: (v: T) => string): PendingChange<string> | null | undefined {
-  return p ? { value: f(p.value), executableAt: p.executableAt } : p;
-}
-
-function current<T>(v: T | undefined, f: (v: T) => string): string {
-  return v === undefined ? "unknown" : f(v);
-}
-
-function pendingViews(): PendingView[] {
-  const s = settings;
-  return [
-    { label: "Deposit cap", change: formatPending(s.pendingMaxTvl, stx0), current: current(s.maxTvl, stx0), appliedBy: "Anyone can apply it" },
-    { label: "Performance fee", change: formatPending(s.pendingFeeBps, pct), current: current(s.performanceFeeBps, pct), appliedBy: "Anyone can apply it" },
-    { label: "Fee recipient", change: formatPending(s.pendingFeeRecipient, shortAddr), current: current(s.feeRecipient, shortAddr), appliedBy: "Anyone can apply it" },
-    { label: "Admin", change: formatPending(s.pendingAdmin, shortAddr), current: current(s.admin, shortAddr), appliedBy: "The proposed admin can accept it" },
-  ];
+const PARAM_LABELS: Record<string, string> = {
+  "max-tvl": "Deposit cap", "fee-bps": "Performance fee", "max-deploy-bps": "Sweep cap", "fee-recipient": "Fee recipient",
+  strategy: "Strategy address", guardian: "Guardian", admin: "Admin", "resume-sweeps": "Resume sweeps after a drawdown block",
+};
+function formatParam(p: PendingChange): string {
+  if (p.value === null) return "";
+  if (typeof p.value === "string") return shortAddr(p.value);
+  if (p.param === "max-tvl") return stx(p.value, 0);
+  return pct(p.value);
 }
 
 function renderPendingPanel(): void {
@@ -349,43 +362,30 @@ function renderPendingPanel(): void {
     el.innerHTML = `<div class="skeleton">loading…</div>`;
     return;
   }
-  const views = pendingViews();
-  const queued = views.filter((v) => v.change);
-  const unknownCount = views.filter((v) => v.change === undefined).length;
-  const rules = `Changes to the deposit cap, performance fee, fee recipient or admin must wait here in public for ${TIMELOCK_DELAY_BLOCKS.toLocaleString()} blocks, ${blocksToDuration(TIMELOCK_DELAY_BLOCKS)}, before they can take effect. A queued change has no cancel. It can only be replaced by queuing a different value, which restarts the wait.`;
-
-  if (queued.length === 0) {
-    el.innerHTML =
-      unknownCount > 0
-        ? `<p class="notice bad">Couldn't check for queued changes just now. Retrying automatically.</p><p class="notice">${rules}</p>`
-        : `<p>None queued.</p><p class="notice">${rules}</p>`;
+  const rules = `Every admin change must wait here in public for ${blocksText(TIMELOCK_BURN)}, before it can take effect. No new sweep can start while any change is waiting, and an epoch lasts at most ${MAX_EPOCH_BURN} blocks, so depositors have time to exit first.`;
+  if (pending === undefined) {
+    el.innerHTML = `<p class="notice bad">Couldn't check for queued changes just now. Retrying automatically.</p><p class="notice">${rules}</p>`;
     return;
   }
-
-  const cards = queued
-    .map((v) => {
-      const c = v.change!;
-      const remaining = blockHeight !== undefined ? c.executableAt - blockHeight : undefined;
-      const when =
-        remaining === undefined
-          ? `Can take effect from block ${c.executableAt.toLocaleString()}.`
-          : remaining <= 0
-            ? `Can take effect now. ${v.appliedBy}.`
-            : `Can take effect from block ${c.executableAt.toLocaleString()}, in ${blocksToDuration(remaining)}. ${v.appliedBy} then.`;
-      return `
-      <div class="pending-card">
-        <div class="stat-row"><span class="label">${v.label}</span><span>${v.current} to ${c.value}</span></div>
-        <p class="notice">${when}</p>
-      </div>`;
+  if (pending.length === 0) {
+    el.innerHTML = `<p>None queued.</p><p class="notice">${rules}</p>`;
+    return;
+  }
+  const cards = pending
+    .map((p) => {
+      const left = burnHeight !== undefined ? p.executableAt - burnHeight : undefined;
+      const when = left === undefined
+        ? `Can take effect from Bitcoin block ${p.executableAt.toLocaleString()}.`
+        : left <= 0n
+          ? "Can take effect now."
+          : `Can take effect from Bitcoin block ${p.executableAt.toLocaleString()}, in ${burnToDuration(left)}.`;
+      const v = formatParam(p);
+      return `<div class="pending-card">
+        <div class="stat-row"><span class="label">${PARAM_LABELS[p.param] ?? escapeHtml(p.param)}</span><span>${v ? `to ${v}` : "queued"}</span></div>
+        <p class="notice">${when}</p></div>`;
     })
     .join("");
-
-  const exitWarning =
-    live.freeBalance === 0n
-      ? `<p class="notice bad">The vault holds no free STX right now because it's all deployed to the strategy, so the contract would reject a withdrawal request. You may not be able to exit before a queued change takes effect.</p>`
-      : "";
-  const incomplete = unknownCount > 0 ? `<p class="notice bad">Some checks for queued changes failed just now, so this list may be incomplete.</p>` : "";
-  el.innerHTML = cards + exitWarning + incomplete + `<p class="notice">${rules}</p>`;
+  el.innerHTML = cards + (stale.has("pending") ? `<p class="notice bad">This list may be out of date.</p>` : "") + `<p class="notice">${rules}</p>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -394,30 +394,32 @@ function renderPendingPanel(): void {
 
 const CONSENT_ITEMS: { key: keyof typeof consent; label: string }[] = [
   {
-    key: "custody",
+    key: "strategy",
     label:
-      "This vault has a single admin, and the admin's cooperation is required to get swept capital back. When the admin moves vault funds out to run the trading strategy, the contract cannot verify what happens to that capital next, or confirm the result reported back is the whole truth. The admin also holds a kill switch and can pause new deposits and strategy sweeps at any time — these are real, discretionary powers held by one person, not purely automated contract logic.",
+      "When the admin sweeps capital to the strategy (at most the sweep cap shown above), the contract cannot verify what happens to it until it comes back. The strategy reports the result by returning STX. If it does not return within the epoch deadline, anyone can write the epoch off, and the vault then carries that capital at zero until any late recovery.",
   },
   {
     key: "audit",
-    label: "This contract has had an internal manual review and a 60-test automated suite — it has NOT had a professional third-party security audit.",
+    label: "The v2 contracts have had an independent design and code review and an automated test suite. They have NOT had a professional third-party security audit.",
   },
   {
-    key: "cap",
-    label: "Deposits are deliberately capped during this pilot phase. The cap is only raised after a defined, published review — not on demand.",
-  },
-  {
-    key: "withdrawal",
+    key: "timing",
     label:
-      "A withdrawal request can take real time to become claimable, and can be rejected at the moment you ask (not paused — rejected, so you'd retry later) if the vault's capital is fully deployed to the strategy right then. Once a request is accepted, it cannot later be blocked or frozen.",
+      "While the vault is IDLE, a withdrawal is priced when I request it and claimable after the idle delay. While it is DEPLOYED, my deposit or withdrawal is queued and priced only when the epoch settles, so the price I get can differ from the price I see now. I can cancel a queued item until then.",
   },
   {
     key: "fee",
-    label: "DeepStack charges a performance fee only when realized gains take the vault as a whole above its previous high, never on deposits or paper gains. The high is tracked for the whole vault, not per depositor, so I could pay part of a fee while still below my own entry value.",
+    label: "A performance fee is taken only when an epoch settles with the share price above its previous high-water mark, and only on the gain above it. It is paid in new shares, never from deposits.",
+  },
+  {
+    key: "testnet",
+    label: NETWORK === "testnet"
+      ? "This is the testnet deployment. Testnet STX has no value and this deployment may be reset."
+      : "This vault is in a capped pilot phase. The cap is raised only after a published review.",
   },
   {
     key: "jurisdiction",
-    label: "I am not a resident of, and am not accessing this from, a jurisdiction where interacting with this contract would be unlawful, and I am depositing on my own behalf.",
+    label: "I am not a resident of, and am not accessing this from, a jurisdiction where interacting with this contract would be unlawful, and I am acting on my own behalf.",
   },
 ];
 
@@ -431,25 +433,29 @@ function renderConsentGate(): void {
         <span>${item.label}</span>
       </label>`,
     ).join("") +
-    `<p class="notice">This is not an investment. This interface lets you deposit STX into a published Clarity vault contract that executes a documented strategy for a fee — it is not a promise of profit or a solicitation to invest. Full disclosure: <a href="https://github.com/mattglory/deepstack/blob/main/docs/VAULT_DISCLOSURE.md" target="_blank" rel="noopener">VAULT_DISCLOSURE.md</a>.</p>`;
-
+    `<p class="notice">This is not an investment and not a promise of profit. This page lets you deposit STX into a published Clarity vault contract. Design and terms: <a href="https://github.com/mattglory/deepstack/blob/main/docs/VAULT_V2_DESIGN.md" target="_blank" rel="noopener">VAULT_V2_DESIGN.md</a>.</p>`;
   el.querySelectorAll<HTMLInputElement>("input[data-consent]").forEach((input) => {
     input.addEventListener("change", () => {
-      const key = input.dataset.consent as keyof typeof consent;
-      consent[key] = input.checked;
+      consent[input.dataset.consent as keyof typeof consent] = input.checked;
       renderDepositPanel();
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-// Deposit panel
+// Deposit
 // ---------------------------------------------------------------------------
 
-function deployedNote(extra: string): string {
-  const deployed = live.capitalAtStrategy;
-  if (deployed === undefined || deployed === 0n) return "";
-  return `<p class="notice">${fmtStx(deployed, 2)} STX of the vault is deployed to the strategy and counted at the amount sent out, not its current market value. ${extra}</p>`;
+function depositHeadroom(s: VaultState): bigint {
+  const used = s.totalAssets + s.pendingDeposits;
+  return s.maxTvl > used ? s.maxTvl - used : 0n;
+}
+
+function wrongNetworkNotice(): string | null {
+  if (!address) return null;
+  if (!addressMatchesNetwork(address)) return `Your wallet is on the wrong network. Switch it to ${NETWORK}, then reconnect.`;
+  if (networkOk === false) return `The API answering this page is not on ${NETWORK}, so signing is disabled.`;
+  return null;
 }
 
 function renderDepositPanel(): void {
@@ -458,96 +464,73 @@ function renderDepositPanel(): void {
     el.innerHTML = `<div class="skeleton">loading…</div>`;
     return;
   }
-  const { totalAssets, depositsPaused, shareSupply } = live;
-  const { maxTvl } = settings;
-  const known = totalAssets !== undefined && maxTvl !== undefined && depositsPaused !== undefined && shareSupply !== undefined;
-  const headroom = known && maxTvl > totalAssets ? maxTvl - totalAssets : 0n;
-  const full = known && headroom === 0n;
-  const paused = depositsPaused === true;
-  const connected = address !== null;
-  const gateOpen = consentAllChecked();
-
+  const s = vs;
+  const headroom = s ? depositHeadroom(s) : 0n;
   let notice = "";
   let bad = true;
-  if (!connected) [notice, bad] = ["Connect your wallet to deposit.", false];
-  else if (networkOk === false) notice = "Your wallet isn't on Stacks mainnet. Switch networks before depositing.";
-  else if (!known) notice = "Can't confirm the vault's cap and pause state right now, so deposits stay disabled until they load.";
-  else if (paused) notice = "Deposits are paused by the vault admin. Withdrawal requests and claims are not affected.";
-  else if (full) notice = `This vault is full for Phase 1: the ${fmtStx(maxTvl, 0)} STX cap is reached. Check back after the next published cap review.`;
-  else if (!gateOpen) [notice, bad] = ["Check every box above before depositing.", false];
+  if (!address) [notice, bad] = ["Connect your wallet to deposit.", false];
+  else if (wrongNetworkNotice()) notice = wrongNetworkNotice()!;
+  else if (!s) notice = "Can't load the vault's state right now, so deposits stay disabled until it loads.";
+  else if (!s.initialized) notice = "The vault has not been initialized yet.";
+  else if (s.depositsPaused) notice = "Deposits are paused. Withdrawals, claims and cancels are not affected.";
+  else if (headroom === 0n) notice = `The ${stx(s.maxTvl, 0)} pilot cap is reached.`;
+  else if (!consentAllChecked()) [notice, bad] = ["Check every box above before depositing.", false];
 
-  const inputDisabled = !connected || !known || paused || full;
-  const buttonDisabled = inputDisabled || networkOk === false || !gateOpen || busy;
+  const mode = s?.epochOpen
+    ? `<p class="notice">The vault is DEPLOYED. A deposit now is queued for epoch ${s.currentEpoch} and turned into shares at that epoch's settlement price. You can cancel it until then.</p>`
+    : s
+      ? `<p class="notice">The vault is IDLE. A deposit now mints shares immediately at ${fmtPrice(s.pps)} STX per share.</p>`
+      : "";
+  const amt = parseUnits(draftDeposit, STX_DECIMALS);
+  const preview = s && !s.epochOpen && amt && amt > 0n ? `<p class="notice">You would receive ${fmtShares(sharesForAssets(amt, s.totalAssets, s.supply), 6)} shares.</p>` : "";
+  const inputDisabled = !address || !s || !s.initialized || s.depositsPaused || headroom === 0n;
+  const btnDisabled = inputDisabled || !walletOk() || !consentAllChecked() || busy;
   el.innerHTML = `
     <div class="field">
-      <label for="deposit-amount">Amount (STX).${known ? ` Up to ${fmtStx(headroom, 6)} STX of cap headroom remains.` : ""}</label>
-      <input type="number" id="deposit-amount" min="0" step="0.000001" ${known ? `max="${microToInput(headroom)}"` : ""} value="${draftDepositAmount}" ${inputDisabled ? "disabled" : ""} />
+      <label for="deposit-amount">Amount (STX).${s ? ` Up to ${fmtStx(headroom, 6)} STX of cap headroom remains.` : ""}</label>
+      <input type="text" inputmode="decimal" id="deposit-amount" value="${escapeHtml(draftDeposit)}" ${inputDisabled ? "disabled" : ""} />
     </div>
-    <button id="btn-deposit" ${buttonDisabled ? "disabled" : ""}>Deposit</button>
+    <div id="deposit-preview">${preview}</div>
+    <button id="btn-deposit" ${btnDisabled ? "disabled" : ""}>${s?.epochOpen ? "Queue deposit" : "Deposit"}</button>
     ${notice ? `<p class="notice${bad ? " bad" : ""}">${notice}</p>` : ""}
-    ${deployedNote("New shares are priced on that basis, and the real result is only known when that capital comes back.")}
-  `;
-
-  const amountInput = document.getElementById("deposit-amount") as HTMLInputElement | null;
-  amountInput?.addEventListener("input", () => {
-    const v = parseAmount(amountInput.value);
-    if (known && v !== null && v > headroom) amountInput.value = microToInput(headroom);
-    draftDepositAmount = amountInput.value;
+    ${mode}`;
+  const input = document.getElementById("deposit-amount") as HTMLInputElement;
+  input.addEventListener("input", () => {
+    draftDeposit = input.value;
+    const a = parseUnits(draftDeposit, STX_DECIMALS);
+    const p = document.getElementById("deposit-preview")!;
+    p.innerHTML = s && !s.epochOpen && a && a > 0n ? `<p class="notice">You would receive ${fmtShares(sharesForAssets(a, s.totalAssets, s.supply), 6)} shares.</p>` : "";
   });
   document.getElementById("btn-deposit")?.addEventListener("click", onDeposit);
 }
 
 async function onDeposit(): Promise<void> {
-  if (!address || networkOk === false) return;
-  const { totalAssets, depositsPaused, shareSupply } = live;
-  const { maxTvl } = settings;
-  if (totalAssets === undefined || maxTvl === undefined || shareSupply === undefined || depositsPaused !== false) {
-    setStatus("Deposits aren't available right now.", "error");
-    return;
-  }
-  const amount = parseAmount(draftDepositAmount);
-  if (amount === null || amount <= 0n) {
-    setStatus("Enter an STX amount greater than 0, with at most 6 decimal places.", "error");
-    return;
-  }
-  const headroom = maxTvl > totalAssets ? maxTvl - totalAssets : 0n;
-  if (amount > headroom) {
-    setStatus(`That's more than the ${fmtStx(headroom, 6)} STX of cap headroom remaining.`, "error");
-    return;
-  }
-  if (shareSupply === 0n && amount < MIN_FIRST_DEPOSIT) {
-    setStatus("The first deposit into an empty vault must be at least 1 STX.", "error");
-    return;
-  }
-  if (sharesForDeposit(amount, totalAssets, shareSupply) === 0n) {
-    setStatus("That amount is too small to receive any shares.", "error");
-    return;
-  }
-  busy = true;
-  renderDepositPanel();
-  try {
-    const { txid } = await depositStx(address, amount);
-    if (!txid) throw new Error("no transaction id came back, so the request may have been rejected in your wallet");
-    setStatus(`Broadcast ${txid}. Confirming, which can take a few minutes.`, "info");
-    const outcome = await waitForTx(txid);
-    if (outcome.status === "success") {
-      draftDepositAmount = "";
-      setStatus(`Deposit confirmed: ${txid}`, "success");
-    } else {
-      setStatus(`The deposit did not go through: ${outcome.status}${outcome.repr ? ` (${outcome.repr})` : ""}`, "error");
-    }
-  } catch (err) {
-    setStatus(`Deposit failed: ${(err as Error).message}`, "error");
-  } finally {
-    busy = false;
-    await refreshAll();
-  }
+  const s = vs;
+  if (!address || !walletOk() || !s) return;
+  const amount = parseUnits(draftDeposit, STX_DECIMALS);
+  if (amount === null || amount <= 0n) return setStatus("Enter an STX amount greater than 0, with at most 6 decimal places.", "error");
+  if (amount > depositHeadroom(s)) return setStatus(`That is more than the ${stx(depositHeadroom(s))} of cap headroom remaining.`, "error");
+  if (!s.epochOpen && sharesForAssets(amount, s.totalAssets, s.supply) === 0n) return setStatus("That amount is too small to receive any shares.", "error");
+  const who = address;
+  const queuedInto = s.epochOpen ? s.currentEpoch : null;
+  await runTx(
+    queuedInto !== null ? "Queuing the deposit" : "Depositing",
+    () => deposit(who, amount),
+    (repr) => {
+      draftDeposit = "";
+      // (ok u0) means it was queued; the epoch it joined is the one open at signing (a later
+      // epoch is also found by the recent-epoch scan).
+      if (repr === "(ok u0)" && queuedInto !== null) {
+        rememberEpoch(who, queuedInto);
+        return `Deposit of ${stx(amount)} queued for epoch ${queuedInto}.`;
+      }
+      return `Deposit of ${stx(amount)} confirmed.`;
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Position panel (personal). DeepStack's fee is charged on the VAULT's cumulative realized P&L
-// as a whole (contracts/deepstack-vault.clar), not per depositor. Any past fee is already in
-// the share value below, not a separate charge at withdrawal time.
+// Position + withdraw
 // ---------------------------------------------------------------------------
 
 function renderPositionPanel(): void {
@@ -558,52 +541,13 @@ function renderPositionPanel(): void {
     return;
   }
   section.hidden = false;
-  const { totalAssets, shareSupply, cumulativeRealizedPnl, highWaterMark } = live;
-  // Exactly what the contract's assets-for-shares returns for your whole balance right now,
-  // i.e. what a withdrawal request for all of it would lock (liquidity permitting).
-  const value = shareBalance !== undefined && totalAssets !== undefined && shareSupply !== undefined ? assetsForShares(shareBalance, totalAssets, shareSupply) : undefined;
-  const valueStale = stale.has("user.shareBalance") || stale.has("live.totalAssets") || stale.has("live.shareSupply");
-  const valueHtml = value === undefined ? UNAVAILABLE : valueStale ? `<span class="stale" title="${STALE_TITLE}">${fmtStx(value, 6)} STX</span>` : `${fmtStx(value, 6)} STX`;
-  const fee = settings.performanceFeeBps !== undefined ? pct(settings.performanceFeeBps) : "performance";
-
+  const s = vs;
+  const value = shareBalance !== undefined && s ? assetsForShares(shareBalance, s.totalAssets, s.supply) : undefined;
   el.innerHTML = `
-    <div class="stat-row"><span class="label">Your shares (dsSTX)</span><span>${show(shareBalance, "user.shareBalance", (v) => fmtStx(v, 6))}</span></div>
-    <div class="stat-row"><span class="label">Your position, as the contract values it now</span><span>${valueHtml}</span></div>
-    <div class="stat-row"><span class="label">Vault cumulative realized P&amp;L</span><span>${show(cumulativeRealizedPnl, "live.cumulativeRealizedPnl", (v) => `${fmtStx(v, 6)} STX`)}</span></div>
-    <div class="stat-row"><span class="label">Vault high-water mark</span><span>${show(highWaterMark, "live.highWaterMark", (v) => `${fmtStx(v, 6)} STX`)}</span></div>
-    ${deployedNote("Its real result is only known when it comes back, so this value can change then.")}
-    <p class="notice">The ${fee} fee is charged on the vault's realized P&amp;L as a whole, only above the vault's prior peak, and is already reflected in the value above. There is no separate fee when you withdraw.</p>
-    ${renderHwmChart(getHistory())}
-  `;
-}
-
-function renderHwmChart(history: { t: number; pnlStx: number; hwmStx: number }[]): string {
-  if (history.length < 2) return `<p class="notice">Chart builds up from your own visits over time. Not enough history yet.</p>`;
-  const w = 600, h = 60, pad = 4;
-  const all = history.flatMap((p) => [p.pnlStx, p.hwmStx]);
-  const min = Math.min(...all, 0), max = Math.max(...all, 0.000001);
-  const x = (i: number) => pad + (i / (history.length - 1)) * (w - 2 * pad);
-  const y = (v: number) => h - pad - ((v - min) / (max - min || 1)) * (h - 2 * pad);
-  const pnlPts = history.map((p, i) => `${x(i)},${y(p.pnlStx)}`).join(" ");
-  const hwmPts = history.map((p, i) => `${x(i)},${y(p.hwmStx)}`).join(" ");
-  return `
-    <svg class="hwm-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-      <polyline points="${hwmPts}" fill="none" stroke="#e8a33d" stroke-width="2" />
-      <polyline points="${pnlPts}" fill="none" stroke="#4fae6e" stroke-width="2" />
-    </svg>
-    <p class="notice">High-water mark (orange) vs. cumulative realized P&amp;L (green), built from this browser's own visits, not a full history.</p>
-  `;
-}
-
-// ---------------------------------------------------------------------------
-// Withdraw panel
-// ---------------------------------------------------------------------------
-
-function claimStatusText(w: WithdrawalRequest): { text: string; claimable: boolean } {
-  if (w.claimed) return { text: "claimed", claimable: false };
-  if (blockHeight === undefined) return { text: `claimable from block ${w.claimableAt.toLocaleString()}`, claimable: false };
-  const remaining = w.claimableAt - blockHeight;
-  return remaining <= 0 ? { text: "claimable now", claimable: true } : { text: `claimable in ${blocksToDuration(remaining)}`, claimable: false };
+    <div class="stat-row"><span class="label">Your shares (dsSTX2), in your wallet</span><span>${show(shareBalance, "user.shares", (v) => fmtShares(v, 6))}</span></div>
+    <div class="stat-row"><span class="label">Value at the current share price</span><span>${show(value, "state", (v) => stx(v))}</span></div>
+    ${s?.epochOpen ? `<p class="notice">Capital at the strategy is counted at the amount sent out until it returns, so this value can change at settlement.</p>` : ""}
+    <p class="notice">Shares queued for withdrawal are held by the vault and are listed under your queued items, not here. Any past fee is already reflected in the share price.</p>`;
 }
 
 function renderWithdrawPanel(): void {
@@ -614,160 +558,119 @@ function renderWithdrawPanel(): void {
     return;
   }
   section.hidden = false;
-
-  // The contract only ACCEPTS a request whose locked amount fits in the vault's free STX
-  // (ERR-INSUFFICIENT-LIQUIDITY, u107), so cap what's requestable to that up front instead of
-  // letting a user pay a fee for a request that is certain to be rejected.
-  const { freeBalance, totalAssets, shareSupply } = live;
-  const liquidityKnown = freeBalance !== undefined && totalAssets !== undefined && shareSupply !== undefined;
-  const maxByLiquidity = liquidityKnown ? maxSharesWithinLiquidity(freeBalance, totalAssets, shareSupply) : undefined;
-  const requestable = maxByLiquidity !== undefined && shareBalance !== undefined ? (shareBalance < maxByLiquidity ? shareBalance : maxByLiquidity) : undefined;
-
+  const s = vs;
   let notice = "";
   let bad = true;
-  if (shareBalance === undefined) notice = "Couldn't read your share balance yet. Retrying automatically.";
-  else if (shareBalance === 0n) [notice, bad] = ["You don't hold any vault shares.", false];
-  else if (!liquidityKnown) notice = "Can't check how much free STX the vault holds right now, so requests stay disabled until it loads.";
-  else if (freeBalance === 0n)
-    notice = "The vault holds no free STX right now because it's all deployed to the strategy, so the contract would reject a withdrawal request. Requests become possible again when the admin returns capital or new deposits arrive.";
-  else if (requestable !== undefined && requestable < shareBalance)
-    [notice, bad] = [`Only ${fmtStx(requestable, 6)} of your shares, worth ${fmtStx(assetsForShares(requestable, totalAssets, shareSupply), 6)} STX, can be requested right now. That's all the free STX the vault holds.`, false];
+  if (wrongNetworkNotice()) notice = wrongNetworkNotice()!;
+  else if (shareBalance === undefined) notice = "Couldn't read your share balance yet. Retrying automatically.";
+  else if (shareBalance === 0n) [notice, bad] = ["You don't hold any vault shares in your wallet.", false];
+  else if (!s) notice = "Can't load the vault's state right now.";
 
-  const canRequest = requestable !== undefined && requestable > 0n && networkOk !== false && !busy;
-  const pendingCards = knownWithdrawals
-    .map((w) => {
-      const s = claimStatusText(w);
-      return `
-      <div class="pending-card">
-        <div class="stat-row"><span class="label">Withdrawal #${w.id}</span><span>${fmtStx(w.lockedStx, 6)} STX</span></div>
-        <div class="stat-row"><span class="label">Status</span><span>${s.text}</span></div>
-        ${!w.claimed ? `<button class="secondary" data-claim-id="${w.id}" ${!s.claimable || busy || networkOk === false ? "disabled" : ""}>Claim</button>` : ""}
-      </div>`;
+  const sh = parseUnits(draftWithdraw, SHARE_DECIMALS);
+  const previewFor = (v: bigint | null) =>
+    s && !s.epochOpen && v && v > 0n ? `<p class="notice">You would be able to claim ${stx(assetsForShares(v, s.totalAssets, s.supply))} after the delay.</p>` : "";
+  const canRequest = !!s && shareBalance !== undefined && shareBalance > 0n && walletOk() && !busy;
+  const mode = s?.epochOpen
+    ? `The vault is DEPLOYED. Your shares will be queued for epoch ${s.currentEpoch} and priced when it settles. You can cancel until then.`
+    : `The vault is IDLE. The STX amount is fixed now and claimable after ${blocksText(WITHDRAWAL_DELAY_BURN)}.`;
+
+  const cards = requests
+    .map((r) => {
+      const left = burnHeight !== undefined ? r.claimableAt - burnHeight : undefined;
+      const ready = left !== undefined && left <= 0n;
+      const text = left === undefined ? `claimable from Bitcoin block ${r.claimableAt.toLocaleString()}` : ready ? "claimable now" : `claimable in ${burnToDuration(left)} (Bitcoin block ${r.claimableAt.toLocaleString()})`;
+      return `<div class="pending-card">
+        <div class="stat-row"><span class="label">Withdrawal #${r.id}</span><span>${stx(r.amount)}</span></div>
+        <div class="stat-row"><span class="label">Status</span><span>${text}</span></div>
+        <button class="secondary" data-claim-id="${r.id}" ${ready && walletOk() && !busy ? "" : "disabled"}>Claim</button></div>`;
     })
     .join("");
 
   el.innerHTML = `
     <div class="field">
-      <label for="withdraw-shares">Shares to redeem. You hold ${show(shareBalance, "user.shareBalance", (v) => fmtStx(v, 6))}.</label>
-      <input type="number" id="withdraw-shares" min="0" step="0.000001" ${requestable !== undefined ? `max="${microToInput(requestable)}"` : ""} value="${draftWithdrawShares}" ${requestable === undefined || requestable === 0n ? "disabled" : ""} />
-    </div>
-    <button id="btn-request-withdrawal" ${canRequest ? "" : "disabled"}>Request withdrawal</button>
-    ${notice ? `<p class="notice${bad ? " bad" : ""}">${notice}</p>` : ""}
-    <p class="notice">A request becomes claimable ${WITHDRAWAL_DELAY_BLOCKS.toLocaleString()} blocks later, ${blocksToDuration(WITHDRAWAL_DELAY_BLOCKS)}. The STX amount is fixed when you request.</p>
-
-    ${pendingCards || `<p class="notice">No withdrawal requests from this browser yet.</p>`}
-
-    <div class="field" style="margin-top:16px">
-      <label for="lookup-id">Check a withdrawal by id, for example from a different device</label>
+      <label for="withdraw-shares">Shares to withdraw. You hold ${show(shareBalance, "user.shares", (v) => fmtShares(v, 6))}.</label>
       <div style="display:flex; gap:8px">
-        <input type="number" id="lookup-id" min="0" step="1" value="${draftLookupId}" />
+        <input type="text" inputmode="decimal" id="withdraw-shares" value="${escapeHtml(draftWithdraw)}" ${canRequest ? "" : "disabled"} />
+        <button class="secondary" id="btn-withdraw-max" ${canRequest ? "" : "disabled"}>Max</button>
+      </div>
+    </div>
+    <div id="withdraw-preview">${previewFor(sh)}</div>
+    <button id="btn-request-withdrawal" ${canRequest ? "" : "disabled"}>${s?.epochOpen ? "Queue withdrawal" : "Request withdrawal"}</button>
+    ${notice ? `<p class="notice${bad ? " bad" : ""}">${notice}</p>` : ""}
+    <p class="notice">${mode}</p>
+    ${cards || `<p class="notice">No idle withdrawal requests from this browser.</p>`}
+    <div class="field" style="margin-top:16px">
+      <label for="lookup-id">Check an idle withdrawal by id, for example one made on another device</label>
+      <div style="display:flex; gap:8px">
+        <input type="text" inputmode="numeric" id="lookup-id" value="${escapeHtml(draftLookup)}" />
         <button class="secondary" id="btn-lookup">Check</button>
       </div>
       <div id="lookup-result"></div>
-    </div>
-  `;
+    </div>`;
 
-  const sharesInput = document.getElementById("withdraw-shares") as HTMLInputElement;
-  sharesInput.addEventListener("input", () => {
-    const v = parseAmount(sharesInput.value);
-    if (requestable !== undefined && v !== null && v > requestable) sharesInput.value = microToInput(requestable);
-    draftWithdrawShares = sharesInput.value;
+  const input = document.getElementById("withdraw-shares") as HTMLInputElement;
+  input.addEventListener("input", () => {
+    draftWithdraw = input.value;
+    document.getElementById("withdraw-preview")!.innerHTML = previewFor(parseUnits(draftWithdraw, SHARE_DECIMALS));
   });
-  const lookupInput = document.getElementById("lookup-id") as HTMLInputElement;
-  lookupInput.addEventListener("input", () => {
-    draftLookupId = lookupInput.value;
+  document.getElementById("btn-withdraw-max")?.addEventListener("click", () => {
+    if (shareBalance === undefined) return;
+    draftWithdraw = toInput(shareBalance, SHARE_DECIMALS);
+    renderWithdrawPanel();
   });
-
+  const lookup = document.getElementById("lookup-id") as HTMLInputElement;
+  lookup.addEventListener("input", () => (draftLookup = lookup.value));
   document.getElementById("btn-request-withdrawal")?.addEventListener("click", onRequestWithdrawal);
-  el.querySelectorAll<HTMLButtonElement>("button[data-claim-id]").forEach((btn) => {
-    btn.addEventListener("click", () => onClaim(Number(btn.dataset.claimId)));
-  });
+  el.querySelectorAll<HTMLButtonElement>("button[data-claim-id]").forEach((b) => b.addEventListener("click", () => onClaimIdle(Number(b.dataset.claimId))));
   document.getElementById("btn-lookup")?.addEventListener("click", onLookup);
   renderLookupResult();
 }
 
 async function onRequestWithdrawal(): Promise<void> {
-  if (!address || networkOk === false) return;
-  const shares = parseAmount(draftWithdrawShares);
-  if (shares === null || shares <= 0n) {
-    setStatus("Enter a share amount greater than 0, with at most 6 decimal places.", "error");
-    return;
-  }
-  if (shareBalance === undefined || shares > shareBalance) {
-    setStatus("That's more shares than you hold.", "error");
-    return;
-  }
-  const { freeBalance, totalAssets, shareSupply } = live;
-  if (freeBalance === undefined || totalAssets === undefined || shareSupply === undefined) {
-    setStatus("Can't check the vault's free STX right now. Try again in a moment.", "error");
-    return;
-  }
-  const locked = assetsForShares(shares, totalAssets, shareSupply);
-  if (locked === 0n) {
-    setStatus("That's too few shares. The request would lock 0 STX and could never be claimed.", "error");
-    return;
-  }
-  if (locked > freeBalance) {
-    setStatus(`That request would lock ${fmtStx(locked, 6)} STX, but the vault only holds ${fmtStx(freeBalance, 6)} free STX right now, so the contract would reject it.`, "error");
-    return;
-  }
-  busy = true;
-  renderWithdrawPanel();
-  try {
-    const { txid } = await requestWithdrawal(address, shares);
-    if (!txid) throw new Error("no transaction id came back, so the request may have been rejected in your wallet");
-    setStatus(`Broadcast ${txid}. Confirming, which can take a few minutes.`, "info");
-    const outcome = await waitForTx(txid);
-    if (outcome.status === "success") {
-      const id = parseOkUintRepr(outcome.repr);
-      if (id !== null) {
-        rememberWithdrawalId(address, id);
-        draftWithdrawShares = "";
-        setStatus(`Withdrawal #${id} requested and confirmed: ${txid}`, "success");
-      } else {
-        setStatus("The withdrawal request confirmed, but its id couldn't be read automatically. Use the lookup below once you know it.", "error");
+  const s = vs;
+  if (!address || !walletOk() || !s) return;
+  const shares = parseUnits(draftWithdraw, SHARE_DECIMALS);
+  if (shares === null || shares <= 0n) return setStatus("Enter a share amount greater than 0, with at most 9 decimal places.", "error");
+  if (shareBalance === undefined || shares > shareBalance) return setStatus("That is more shares than your wallet holds.", "error");
+  if (!s.epochOpen && assetsForShares(shares, s.totalAssets, s.supply) === 0n) return setStatus("That is too few shares to be worth any STX.", "error");
+  const who = address;
+  await runTx(
+    s.epochOpen ? "Queuing the withdrawal" : "Requesting the withdrawal",
+    () => requestWithdrawal(who, shares),
+    (repr) => {
+      draftWithdraw = "";
+      const r = parseRequestRepr(repr);
+      if (!r) return "The withdrawal confirmed, but its id couldn't be read automatically. Check the transaction for it.";
+      if (r.queued) {
+        rememberEpoch(who, BigInt(r.id));
+        return `${fmtShares(shares, 6)} shares queued for withdrawal in epoch ${r.id}.`;
       }
-    } else {
-      setStatus(`The withdrawal request did not go through: ${outcome.status}${outcome.repr ? ` (${outcome.repr})` : ""}`, "error");
-    }
-  } catch (err) {
-    setStatus(`Withdrawal request failed: ${(err as Error).message}`, "error");
-  } finally {
-    busy = false;
-    await refreshAll();
-  }
+      rememberRequest(who, r.id);
+      return `Withdrawal #${r.id} requested.`;
+    },
+  );
 }
 
-async function onClaim(id: number): Promise<void> {
-  if (!address || networkOk === false) return;
-  busy = true;
-  renderWithdrawPanel();
-  try {
-    // claimWithdrawal re-reads the request from the chain and declares its exact payout and
-    // share burn as post-conditions (see writes.ts).
-    const { txid } = await claimWithdrawal(address, id);
-    if (!txid) throw new Error("no transaction id came back, so the request may have been rejected in your wallet");
-    setStatus(`Broadcast ${txid}. Confirming, which can take a few minutes.`, "info");
-    const outcome = await waitForTx(txid);
-    if (outcome.status === "success") setStatus(`Withdrawal #${id} claimed: ${txid}`, "success");
-    else setStatus(`The claim did not go through: ${outcome.status}${outcome.repr ? ` (${outcome.repr})` : ""}`, "error");
-  } catch (err) {
-    setStatus(`Claim failed: ${(err as Error).message}`, "error");
-  } finally {
-    busy = false;
-    await refreshAll();
-  }
-}
+const onClaimIdle = (id: number) => {
+  const who = address;
+  if (!who || !walletOk()) return;
+  return runTx(`Claiming withdrawal #${id}`, () => claimIdle(who, id), () => {
+    forgetRequest(who, id);
+    return `Withdrawal #${id} claimed.`;
+  });
+};
 
 async function onLookup(): Promise<void> {
-  const raw = draftLookupId.trim();
-  const id = Number(raw);
-  if (raw === "" || !Number.isInteger(id) || id < 0) return;
+  const raw = draftLookup.trim();
+  if (!/^\d+$/.test(raw)) return;
   try {
-    lookupResult = (await readWithdrawalRequest(id)) ?? "not-found";
-  } catch (err) {
-    console.warn("withdrawal lookup failed", err);
+    lookupResult = (await readRequest(Number(raw))) ?? "not-found";
+  } catch {
     lookupResult = "error";
+  }
+  if (lookupResult !== "not-found" && lookupResult !== "error" && address && lookupResult.owner === address) {
+    rememberRequest(address, lookupResult.id); // it's theirs: track it like one made here
+    void refreshAll();
   }
   renderLookupResult();
 }
@@ -776,11 +679,87 @@ function renderLookupResult(): void {
   const el = document.getElementById("lookup-result");
   if (!el) return;
   if (lookupResult === null) el.innerHTML = "";
-  else if (lookupResult === "not-found") el.innerHTML = `<p class="notice">No withdrawal request with that id.</p>`;
+  else if (lookupResult === "not-found") el.innerHTML = `<p class="notice">No open withdrawal with that id. It may already be claimed.</p>`;
   else if (lookupResult === "error") el.innerHTML = `<p class="notice bad">Couldn't check that just now. Try again in a moment.</p>`;
   else {
-    const w = lookupResult;
-    el.innerHTML = `<p class="notice">Owner ${shortAddr(w.owner)} · ${fmtStx(w.lockedStx, 6)} STX · ${claimStatusText(w).text}</p>`;
+    const r = lookupResult;
+    const mine = address && r.owner === address ? " (yours, added above)" : "";
+    el.innerHTML = `<p class="notice">Owner ${shortAddr(r.owner)}${mine} · ${stx(r.amount)} · claimable from Bitcoin block ${r.claimableAt.toLocaleString()}</p>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Queued and claimable epoch items
+// ---------------------------------------------------------------------------
+
+function renderQueuedPanel(): void {
+  const section = document.getElementById("queued-panel")!;
+  const el = document.getElementById("queued-body")!;
+  if (!address || lastRefreshAt === null) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const ok = walletOk() && !busy;
+  const cards: string[] = [];
+  for (const { e, ep, dep, wd } of epochItems) {
+    const open = !ep.settled;
+    if (dep > 0n) {
+      const [text, btn] = open
+        ? [`${stx(dep)} queued, joins at settlement`, `<button class="secondary" data-act="cancel-dep" data-e="${e}" ${ok ? "" : "disabled"}>Cancel deposit</button>`]
+        : ep.writtenOff
+          ? [`${stx(dep)} to refund 1:1 (epoch written off)`, `<button data-act="claim-dep" data-e="${e}" ${ok ? "" : "disabled"}>Claim refund</button>`]
+          : [`${stx(dep)} became ${fmtShares((dep * ep.depSharesMinted) / ep.depTotal, 6)} shares`, `<button data-act="claim-dep" data-e="${e}" ${ok ? "" : "disabled"}>Claim shares</button>`];
+      cards.push(`<div class="pending-card"><div class="stat-row"><span class="label">Epoch ${e} deposit</span><span>${text}</span></div><div class="btn-row">${btn}</div></div>`);
+    }
+    if (wd > 0n) {
+      const [text, btn] = open
+        ? [`${fmtShares(wd, 6)} shares queued, priced at settlement`, `<button class="secondary" data-act="cancel-wd" data-e="${e}" ${ok ? "" : "disabled"}>Cancel withdrawal</button>`]
+        : ep.writtenOff
+          ? [`${fmtShares(wd, 6)} shares to hand back unpriced (epoch written off)`, `<button data-act="claim-wd" data-e="${e}" ${ok ? "" : "disabled"}>Claim shares back</button>`]
+          : [`${fmtShares(wd, 6)} shares became ${stx((wd * ep.wdStxPaid) / ep.wdSharesTotal)}`, `<button data-act="claim-wd" data-e="${e}" ${ok ? "" : "disabled"}>Claim STX</button>`];
+      cards.push(`<div class="pending-card"><div class="stat-row"><span class="label">Epoch ${e} withdrawal</span><span>${text}</span></div><div class="btn-row">${btn}</div></div>`);
+    }
+  }
+  const staleNote = stale.has("user.epochs") ? `<p class="notice bad">Couldn't refresh this list just now. Showing the last good reading.</p>` : "";
+  el.innerHTML = (cards.join("") || `<p class="notice">Nothing queued or waiting to be claimed in the last ${EPOCH_SCAN} epochs.</p>`) + staleNote;
+
+  el.querySelectorAll<HTMLButtonElement>("button[data-act]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const who = address;
+      if (!who || !walletOk()) return;
+      const e = BigInt(b.dataset.e!);
+      const act = b.dataset.act;
+      if (act === "cancel-dep") void runTx("Cancelling the queued deposit", () => cancelDeposit(who, e), () => "Queued deposit cancelled and refunded.");
+      else if (act === "cancel-wd") void runTx("Cancelling the queued withdrawal", () => cancelWithdrawal(who, e), () => "Queued withdrawal cancelled. Your shares are back in your wallet.");
+      else if (act === "claim-dep") void runTx(`Claiming the epoch ${e} deposit`, () => claimEpochDeposit(who, e), () => `Epoch ${e} deposit claimed.`);
+      else if (act === "claim-wd") void runTx(`Claiming the epoch ${e} withdrawal`, () => claimEpochWithdrawal(who, e), () => `Epoch ${e} withdrawal claimed.`);
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// One path for every transaction: sign in the wallet, wait for the result, report it plainly.
+// ---------------------------------------------------------------------------
+
+async function runTx(label: string, send: () => Promise<TxResult>, onSuccess: (repr: string | undefined) => string): Promise<void> {
+  if (busy) return;
+  busy = true;
+  renderAll();
+  try {
+    setStatus(`${label}: confirm in your wallet.`, "info");
+    const { txid } = await send();
+    if (!txid) throw new Error("no transaction id came back, so it may have been rejected in your wallet");
+    setStatus(`${label}: broadcast. Confirming, which can take a few minutes.`, "info", false, txid);
+    const out = await waitForTx(txid);
+    if (out.status === "success") setStatus(onSuccess(out.repr), "success", false, txid);
+    else if (out.status === "timeout") setStatus(`${label}: still unconfirmed after several minutes. It may still go through.`, "info", false, txid);
+    else setStatus(`${label} did not go through: ${out.status}${out.repr ? ` ${out.repr}` : ""}`, "error", false, txid);
+  } catch (err) {
+    setStatus(`${label} failed: ${(err as Error).message}`, "error");
+  } finally {
+    busy = false;
+    await refreshAll();
   }
 }
 
@@ -789,9 +768,8 @@ function renderLookupResult(): void {
 // ---------------------------------------------------------------------------
 
 function renderAll(): void {
-  // Panels are rebuilt with innerHTML, which would drop keyboard focus from a field the user
-  // is typing in whenever a background refresh lands. Put it back afterwards.
   const focusedId = (document.activeElement as HTMLElement | null)?.id || null;
+  renderNetworkBanner();
   renderStatusBanner();
   renderWalletArea();
   renderVaultStats();
@@ -800,19 +778,18 @@ function renderAll(): void {
   renderDepositPanel();
   renderPositionPanel();
   renderWithdrawPanel();
+  renderQueuedPanel();
   if (focusedId) document.getElementById(focusedId)?.focus();
 }
 
 async function init(): Promise<void> {
   renderAll();
   await refreshAll();
-  // Light polling so countdowns and balances stay current. Skipped while the tab is hidden and
-  // caught up as soon as it's visible again.
   setInterval(() => {
-    if (document.visibilityState === "visible") void refreshAll();
-  }, LIVE_REFRESH_MS);
+    if (document.visibilityState === "visible" && !busy) void refreshAll();
+  }, REFRESH_MS);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && (lastRefreshAt === null || Date.now() - lastRefreshAt >= LIVE_REFRESH_MS)) void refreshAll();
+    if (document.visibilityState === "visible" && (lastRefreshAt === null || Date.now() - lastRefreshAt >= REFRESH_MS)) void refreshAll();
   });
 }
 

@@ -168,3 +168,18 @@ footer code { color: var(--text); }
 .stat-row { gap: 12px; }
 .stat-row > span:last-child { text-align: right; overflow-wrap: anywhere; }
 footer code { overflow-wrap: anywhere; } /* the full contract id is wider than a phone screen */
+
+.network-banner {
+  background: rgba(232, 163, 61, 0.12);
+  border-bottom: 1px solid var(--warn-border);
+  color: var(--accent);
+  text-align: center;
+  font-size: 13px;
+  padding: 8px 16px;
+}
+.phase { font-weight: 600; }
+.phase.idle { color: var(--ok); }
+.phase.deployed { color: var(--accent); }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.notice a, .panel p a { color: var(--accent); }
+.stat-row > span:last-child { text-align: right; overflow-wrap: anywhere; }

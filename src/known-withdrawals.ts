@@ -1,39 +1,35 @@
-// The vault contract has no index of "withdrawal ids belonging to address X" — next-withdrawal-id
-// is a single global counter, not per-depositor (see contracts/deepstack-vault.clar). Without a
-// backend/indexer, this app can only remember ids IT witnessed being created, per connecting
-// browser. This is a real, disclosed limitation, not hidden: the UI also offers a manual
-// "check a withdrawal by id" lookup (the id is public on-chain either way) as a fallback for a
-// cleared cache or a different device — see the app's own README.
+// The contract has no per-user index, so the site remembers what it saw this browser create:
+// idle request ids and the epochs the user queued into. Keyed by vault + address, so testnet
+// and mainnet data never mix. The manual "check a request by id" lookup covers other devices.
 
-const STORAGE_KEY = "deepstack-known-withdrawals-v1";
+import { VAULT_CONTRACT_ID } from "./config";
 
-type Store = Record<string, number[]>; // address -> withdrawal ids
+const KEY = `deepstack-v2-known:${VAULT_CONTRACT_ID}`;
+type Store = Record<string, { requests: number[]; epochs: string[] }>;
 
 function load(): Store {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as Store) : {};
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(localStorage.getItem(KEY) ?? "{}") as Store; } catch { return {}; }
 }
-
-function save(store: Store): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-  } catch {
-    // best-effort only — never block the UI on a storage failure
-  }
+function save(s: Store): void {
+  try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* best effort */ }
 }
-
-export function rememberWithdrawalId(address: string, id: number): void {
-  const store = load();
-  const ids = new Set(store[address] ?? []);
-  ids.add(id);
-  store[address] = [...ids].sort((a, b) => a - b);
-  save(store);
+function entry(s: Store, addr: string) {
+  return (s[addr] ??= { requests: [], epochs: [] });
 }
-
-export function getKnownWithdrawalIds(address: string): number[] {
-  return load()[address] ?? [];
+export function rememberRequest(addr: string, id: number): void {
+  const s = load(); const e = entry(s, addr);
+  if (!e.requests.includes(id)) e.requests.push(id);
+  save(s);
 }
+export function forgetRequest(addr: string, id: number): void {
+  const s = load(); const e = entry(s, addr);
+  e.requests = e.requests.filter((x) => x !== id);
+  save(s);
+}
+export function rememberEpoch(addr: string, epoch: bigint): void {
+  const s = load(); const e = entry(s, addr);
+  if (!e.epochs.includes(epoch.toString())) e.epochs.push(epoch.toString());
+  save(s);
+}
+export function knownRequests(addr: string): number[] { return load()[addr]?.requests ?? []; }
+export function knownEpochs(addr: string): bigint[] { return (load()[addr]?.epochs ?? []).map((x) => BigInt(x)); }

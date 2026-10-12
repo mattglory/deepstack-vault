@@ -1,82 +1,81 @@
-// Every broadcast here is signed by the CONNECTED USER's own wallet via @stacks/connect's
-// request('stx_callContract', ...). This app never holds or touches a private key.
+// Every broadcast is signed by the CONNECTED USER's own wallet via @stacks/connect request().
 //
-// Post-conditions: exact amounts (willSendEq) in Deny mode on every call. Deny mode means the
-// node aborts the transaction if ANY asset moves that isn't declared here. That applies to
-// every principal involved, the vault contract included, not just the signer (stacks-core
-// check_transaction_postconditions enforces unchecked assets for every principal in Deny
-// mode). A burn counts as the burner "sending" the tokens (ft-burn? logs a transfer from the
-// burner); a mint is not checked at all.
-//
-// `request` is dynamically imported, same reasoning as wallet.ts: these functions only run
-// after a user clicks a deposit/withdraw/claim button, well past first paint.
+// Deny mode with exact post-conditions on every call, covering EVERY asset that moves, the
+// vault contract's own transfers included. In Deny mode the node aborts a transaction if any
+// principal moves an undeclared asset (stacks-core check_transaction_postconditions), and a
+// burn counts as the burner sending. v1 shipped a claim with none and would have aborted every
+// UI claim (review finding M2); the amounts below come from the same integer math the
+// contract uses, read fresh right before signing.
 
 import { Cl, Pc, type PostCondition } from "@stacks/transactions";
-import { SHARE_TOKEN_NAME, TOKEN_CONTRACT_ID, VAULT_CONTRACT_ID } from "./config";
-import { readWithdrawalRequest, type WithdrawalRequest } from "./reads";
+import { NETWORK, SHARE_TOKEN_NAME, TOKEN_CONTRACT_ID, VAULT_CONTRACT_ID } from "./config";
+import { readEpoch, readEpochDeposit, readEpochWithdrawal, readRequest } from "./reads";
 
-export interface TxResult {
-  txid?: string;
-}
+export interface TxResult { txid?: string }
 
-// deposit moves exactly `amount` uSTX from the depositor to the vault, then MINTS shares to
-// the depositor (mints aren't post-condition-checked).
-export async function depositStx(userAddress: string, amount: bigint): Promise<TxResult> {
-  if (amount <= 0n) throw new Error("deposit amount must be > 0");
+async function call(functionName: string, functionArgs: ReturnType<typeof Cl.uint>[], postConditions: PostCondition[]): Promise<TxResult> {
   const { request } = await import("@stacks/connect");
   return request("stx_callContract", {
-    contract: VAULT_CONTRACT_ID,
-    functionName: "deposit",
-    functionArgs: [Cl.uint(amount)],
-    network: "mainnet",
-    postConditions: [Pc.principal(userAddress).willSendEq(amount).ustx()],
-    postConditionMode: "deny",
+    contract: VAULT_CONTRACT_ID, functionName, functionArgs, network: NETWORK,
+    postConditions, postConditionMode: "deny",
   });
 }
 
-// request-withdrawal moves exactly `shares` dsSTX from the depositor into the vault's custody
-// (escrowed, not burned, until claim). No STX moves at request time.
-export async function requestWithdrawal(userAddress: string, shares: bigint): Promise<TxResult> {
-  if (shares <= 0n) throw new Error("share amount must be > 0");
-  const { request } = await import("@stacks/connect");
-  return request("stx_callContract", {
-    contract: VAULT_CONTRACT_ID,
-    functionName: "request-withdrawal",
-    functionArgs: [Cl.uint(shares)],
-    network: "mainnet",
-    postConditions: [Pc.principal(userAddress).willSendEq(shares).ft(TOKEN_CONTRACT_ID, SHARE_TOKEN_NAME)],
-    postConditionMode: "deny",
-  });
+const userStx = (user: string, amt: bigint) => Pc.principal(user).willSendEq(amt).ustx();
+const userShares = (user: string, amt: bigint) => Pc.principal(user).willSendEq(amt).ft(TOKEN_CONTRACT_ID, SHARE_TOKEN_NAME);
+const vaultStx = (amt: bigint) => Pc.principal(VAULT_CONTRACT_ID).willSendEq(amt).ustx();
+const vaultShares = (amt: bigint) => Pc.principal(VAULT_CONTRACT_ID).willSendEq(amt).ft(TOKEN_CONTRACT_ID, SHARE_TOKEN_NAME);
+
+// Idle: STX in, shares minted (mints are not post-condition-checked). Deployed: STX in, queued.
+export const deposit = (user: string, amount: bigint) =>
+  call("deposit", [Cl.uint(amount)], [userStx(user, amount)]);
+
+// Idle: the user's shares are burned (a burn is the burner sending). Deployed: the user's
+// shares move into the vault's escrow. Either way the user sends exactly `shares`.
+export const requestWithdrawal = (user: string, shares: bigint) =>
+  call("request-withdrawal", [Cl.uint(shares)], [userShares(user, shares)]);
+
+// Idle request claim: the vault pays the fixed amount.
+export async function claimIdle(user: string, id: number): Promise<TxResult> {
+  const r = await readRequest(id);
+  if (!r) throw new Error(`request #${id} not found (already claimed?)`);
+  if (r.owner !== user) throw new Error(`request #${id} belongs to another address`);
+  return call("claim-withdrawal", [Cl.uint(id)], [vaultStx(r.amount)]);
 }
 
-// claim-withdrawal moves two things, BOTH out of the vault contract: the locked STX payout
-// (stx-transfer?) and the burn of the escrowed dsSTX (ft-burn? via burn-for-vault). Both must
-// be declared or Deny mode aborts the claim. This shipped on 2026-10-05 with NO
-// post-conditions, so every claim made through this UI would have aborted (found 2026-10-07;
-// the only real claim so far went through the CLI in Allow mode). Both amounts are fixed at
-// request time and can never change, so they're read fresh from the chain and declared exactly.
-export function claimPostConditions(req: Pick<WithdrawalRequest, "lockedStx" | "shares">): PostCondition[] {
-  return [
-    Pc.principal(VAULT_CONTRACT_ID).willSendEq(req.lockedStx).ustx(),
-    Pc.principal(VAULT_CONTRACT_ID).willSendEq(req.shares).ft(TOKEN_CONTRACT_ID, SHARE_TOKEN_NAME),
-  ];
+// Epoch deposit claim: shares from escrow, or a 1:1 STX refund if the epoch was written off.
+export async function claimEpochDeposit(user: string, e: bigint): Promise<TxResult> {
+  const [ep, amt] = await Promise.all([readEpoch(e), readEpochDeposit(e, user)]);
+  if (!ep?.settled) throw new Error(`epoch ${e} is not settled yet`);
+  if (amt <= 0n) throw new Error(`nothing to claim in epoch ${e}`);
+  if (ep.writtenOff) return call("claim-deposit", [Cl.uint(e)], [vaultStx(amt)]);
+  const shares = (amt * ep.depSharesMinted) / ep.depTotal;
+  return call("claim-deposit", [Cl.uint(e)], [vaultShares(shares)]);
 }
 
-export async function claimWithdrawal(claimant: string, id: number): Promise<TxResult> {
-  const req = await readWithdrawalRequest(id);
-  if (!req) throw new Error(`withdrawal #${id} was not found on-chain`);
-  if (req.owner !== claimant) throw new Error(`withdrawal #${id} belongs to a different address`);
-  if (req.claimed) throw new Error(`withdrawal #${id} has already been claimed`);
-  // A request that locked 0 uSTX can never be claimed (stx-transfer? of 0 fails), so don't
-  // let a user pay a fee to find that out.
-  if (req.lockedStx === 0n) throw new Error(`withdrawal #${id} locked 0 STX, so the contract can't pay it out`);
-  const { request } = await import("@stacks/connect");
-  return request("stx_callContract", {
-    contract: VAULT_CONTRACT_ID,
-    functionName: "claim-withdrawal",
-    functionArgs: [Cl.uint(id)],
-    network: "mainnet",
-    postConditions: claimPostConditions(req),
-    postConditionMode: "deny",
-  });
+// Epoch withdrawal claim: STX at the settled price, or the shares back if written off (D14).
+export async function claimEpochWithdrawal(user: string, e: bigint): Promise<TxResult> {
+  const [ep, shares] = await Promise.all([readEpoch(e), readEpochWithdrawal(e, user)]);
+  if (!ep?.settled) throw new Error(`epoch ${e} is not settled yet`);
+  if (shares <= 0n) throw new Error(`nothing to claim in epoch ${e}`);
+  if (ep.writtenOff) return call("claim-epoch-withdrawal", [Cl.uint(e)], [vaultShares(shares)]);
+  const stx = (shares * ep.wdStxPaid) / ep.wdSharesTotal;
+  return call("claim-epoch-withdrawal", [Cl.uint(e)], [vaultStx(stx)]);
 }
+
+// Cancels while the epoch is still open: the vault returns exactly what was queued.
+export async function cancelDeposit(user: string, e: bigint): Promise<TxResult> {
+  const amt = await readEpochDeposit(e, user);
+  if (amt <= 0n) throw new Error("no queued deposit to cancel");
+  return call("cancel-deposit", [], [vaultStx(amt)]);
+}
+export async function cancelWithdrawal(user: string, e: bigint): Promise<TxResult> {
+  const shares = await readEpochWithdrawal(e, user);
+  if (shares <= 0n) throw new Error("no queued withdrawal to cancel");
+  return call("cancel-withdrawal", [], [vaultShares(shares)]);
+}
+
+// Permissionless once the epoch is overdue (D1/D12/D14). Moves no assets at all: the write-off
+// is booked, queued deposits become claimable refunds and queued withdrawals are handed back
+// later by the claims above. Deny mode with no post-conditions therefore pins that down.
+export const settleOverdue = () => call("settle-overdue", [], []);

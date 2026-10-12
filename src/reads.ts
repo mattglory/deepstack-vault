@@ -1,218 +1,108 @@
-// All on-chain reads for this app. No backend: every call goes straight from the browser to
-// the Hiro API (hiro.ts handles key, timeout, retry and concurrency).
-//
-// Two rules, both learned the hard way in this project:
-// 1. A failed read is UNKNOWN, never zero. Parsers throw on an unexpected shape instead of
-//    defaulting. (The main repo's Sep 15 incident: failed reads silently became literal 0.00
-//    and drove a wrong decision.)
-// 2. Each value is read and reported independently (readFields), so one failed call leaves
-//    one number stale instead of throwing away the whole refresh, which is what Promise.all
-//    used to do on a single rejection.
+// All on-chain reads for the v2 site. No backend: every call goes from the browser to the Hiro
+// API (hiro.ts: timeout, retry, concurrency cap). A failed read is UNKNOWN, never zero: the
+// converter throws on anything unexpected and callers keep their last good value.
 
-import { Cl, ClarityValue, cvToJSON, fetchCallReadOnlyFunction } from "@stacks/transactions";
-import { HIRO_API_BASE, TOKEN_CONTRACT_NAME, VAULT_ADDRESS, VAULT_CONTRACT_NAME } from "./config";
+import { Cl, ClarityValue, fetchCallReadOnlyFunction } from "@stacks/transactions";
+import { HIRO_API_BASE, NETWORK, TOKEN_CONTRACT_NAME, VAULT_ADDRESS, VAULT_CONTRACT_NAME } from "./config";
 import { hiroCall, hiroFetch, hiroGetJson } from "./hiro";
 
-async function readOnly(contractName: string, functionName: string, args: ClarityValue[] = [], senderAddress: string = VAULT_ADDRESS): Promise<any> {
+// ClarityValue -> plain JS (bigint for numbers). Throws on (err ...) so failures surface.
+function js(cv: any): any {
+  switch (cv?.type) {
+    case "uint": case "int": return BigInt(cv.value);
+    case "true": return true;
+    case "false": return false;
+    case "address": case "contract": return cv.value;
+    case "none": return null;
+    case "some": case "ok": return js(cv.value);
+    case "err": throw new Error(`contract returned err ${String(cv.value?.value ?? "")}`);
+    case "tuple": return Object.fromEntries(Object.entries(cv.value).map(([k, v]) => [k, js(v)]));
+    case "ascii": case "utf8": return cv.value;
+    default: throw new Error(`unexpected Clarity value type: ${cv?.type}`);
+  }
+}
+
+async function ro(functionName: string, args: ClarityValue[] = [], contractName = VAULT_CONTRACT_NAME, sender = VAULT_ADDRESS): Promise<any> {
   const result = await hiroCall(() =>
     fetchCallReadOnlyFunction({
-      contractAddress: VAULT_ADDRESS,
-      contractName,
-      functionName,
-      functionArgs: args,
-      network: "mainnet",
-      senderAddress,
-      client: { baseUrl: HIRO_API_BASE, fetch: hiroFetch() },
+      contractAddress: VAULT_ADDRESS, contractName, functionName, functionArgs: args,
+      network: NETWORK, senderAddress: sender, client: { baseUrl: HIRO_API_BASE, fetch: hiroFetch() },
     }),
   );
-  return cvToJSON(result);
+  return js(result);
 }
 
-// ---------------------------------------------------------------------------
-// Strict parsers over cvToJSON output
-// ---------------------------------------------------------------------------
-
-function fail(what: string): never {
-  throw new Error(`unexpected response shape for ${what}`);
-}
-const uintOf = (v: any, what: string): bigint => (v?.type === "uint" ? BigInt(v.value) : fail(what));
-const intOf = (v: any, what: string): bigint => (v?.type === "int" ? BigInt(v.value) : fail(what));
-const boolOf = (v: any, what: string): boolean => (v?.type === "bool" && typeof v.value === "boolean" ? v.value : fail(what));
-const principalOf = (v: any, what: string): string => (v?.type === "principal" && typeof v.value === "string" ? v.value : fail(what));
-const okOf = (j: any, what: string): any => (j?.success === true ? j.value : fail(what));
-
-// get-total-assets / get-free-balance return a BARE uint; every other getter wraps its value
-// in (ok ...). Kept as distinct parsers on purpose: mixing them up was a real bug in this
-// project's CLI tooling.
-const bareUint = (j: any, what: string) => uintOf(j, what);
-const okUint = (j: any, what: string) => uintOf(okOf(j, what), what);
-const okInt = (j: any, what: string) => intOf(okOf(j, what), what);
-const okBool = (j: any, what: string) => boolOf(okOf(j, what), what);
-const okPrincipal = (j: any, what: string) => principalOf(okOf(j, what), what);
-
-export interface PendingChange<T> {
-  value: T;
-  executableAt: number; // stacks-block-height from which it can take effect
+export interface VaultState {
+  initialized: boolean; admin: string; strategy: string; guardian: string; feeRecipient: string;
+  maxTvl: bigint; feeBps: bigint; maxDeployBps: bigint;
+  depositsPaused: boolean; sweepsPaused: boolean;
+  vaultStx: bigint; capitalAtStrategy: bigint; pendingDeposits: bigint; ringfenced: bigint;
+  totalAssets: bigint; supply: bigint; pps: bigint; hwmPps: bigint; sweepRefPps: bigint;
+  realizedPnl: bigint; currentEpoch: bigint; epochOpen: boolean; overdue: boolean; noChangePending: boolean;
 }
 
-// (ok (optional { value: T, executable-at: uint }))
-function okPending<T>(j: any, what: string, valueOf: (v: any, what: string) => T): PendingChange<T> | null {
-  const opt = okOf(j, what);
-  if (typeof opt?.type !== "string" || !opt.type.startsWith("(optional")) fail(what);
-  if (opt.value === null) return null;
-  const fields = opt.value?.value;
-  if (!fields) fail(what);
-  return { value: valueOf(fields.value, what), executableAt: Number(uintOf(fields["executable-at"], what)) };
-}
-
-// ---------------------------------------------------------------------------
-// Independent multi-field reads
-// ---------------------------------------------------------------------------
-
-export interface FieldResults<T> {
-  values: Partial<T>;
-  failed: (keyof T)[];
-}
-
-async function readFields<T>(spec: { [K in keyof T]: () => Promise<T[K]> }): Promise<FieldResults<T>> {
-  const keys = Object.keys(spec) as (keyof T)[];
-  const settled = await Promise.allSettled(keys.map((k) => spec[k]()));
-  const values: Partial<T> = {};
-  const failed: (keyof T)[] = [];
-  settled.forEach((r, i) => {
-    const k = keys[i];
-    if (r.status === "fulfilled") values[k] = r.value;
-    else {
-      failed.push(k);
-      console.warn(`read failed: ${String(k)}`, r.reason);
-    }
-  });
-  return { values, failed };
-}
-
-const getter =
-  <R>(functionName: string, parse: (j: any, what: string) => R, contractName = VAULT_CONTRACT_NAME) =>
-  async (): Promise<R> =>
-    parse(await readOnly(contractName, functionName), functionName);
-
-// Amounts are base units (uSTX, or dsSTX for shares), as bigint.
-export interface VaultLive {
-  depositsPaused: boolean;
-  strategyPaused: boolean;
-  totalStxBalance: bigint; // STX held by the vault contract right now
-  capitalAtStrategy: bigint; // STX swept out to the strategy, counted at the amount sent
-  totalAssets: bigint; // the two above: what the cap and the share price use
-  freeBalance: bigint; // held minus reserved for accepted withdrawals: what a new request can draw on
-  totalPendingWithdrawals: bigint;
-  cumulativeRealizedPnl: bigint; // signed
-  highWaterMark: bigint; // signed
-  shareSupply: bigint;
-}
-
-export function readVaultLive(): Promise<FieldResults<VaultLive>> {
-  return readFields<VaultLive>({
-    depositsPaused: getter("get-deposits-paused", okBool),
-    strategyPaused: getter("get-strategy-paused", okBool),
-    totalStxBalance: getter("get-total-stx-balance", okUint),
-    capitalAtStrategy: getter("get-capital-at-strategy", okUint),
-    totalAssets: getter("get-total-assets", bareUint),
-    freeBalance: getter("get-free-balance", bareUint),
-    totalPendingWithdrawals: getter("get-total-pending-withdrawals", okUint),
-    cumulativeRealizedPnl: getter("get-cumulative-realized-pnl", okInt),
-    highWaterMark: getter("get-high-water-mark", okInt),
-    shareSupply: getter("get-total-supply", okUint, TOKEN_CONTRACT_NAME),
-  });
-}
-
-// Timelocked parameters and their queued changes. These can only change after a public wait
-// of TIMELOCK_DELAY_BLOCKS, so they're read less often than VaultLive (see config.ts).
-export interface VaultSettings {
-  admin: string;
-  maxTvl: bigint;
-  performanceFeeBps: number;
-  feeRecipient: string;
-  pendingMaxTvl: PendingChange<bigint> | null;
-  pendingFeeBps: PendingChange<number> | null;
-  pendingFeeRecipient: PendingChange<string> | null;
-  pendingAdmin: PendingChange<string> | null;
-}
-
-export function readVaultSettings(): Promise<FieldResults<VaultSettings>> {
-  const bps = (v: any, what: string) => Number(uintOf(v, what));
-  return readFields<VaultSettings>({
-    admin: getter("get-admin", okPrincipal),
-    maxTvl: getter("get-max-tvl", okUint),
-    performanceFeeBps: getter("get-performance-fee-bps", (j, w) => Number(okUint(j, w))),
-    feeRecipient: getter("get-fee-recipient", okPrincipal),
-    pendingMaxTvl: getter("get-pending-max-tvl", (j, w) => okPending(j, w, uintOf)),
-    pendingFeeBps: getter("get-pending-fee-bps", (j, w) => okPending(j, w, bps)),
-    pendingFeeRecipient: getter("get-pending-fee-recipient", (j, w) => okPending(j, w, principalOf)),
-    pendingAdmin: getter("get-pending-admin", (j, w) => okPending(j, w, principalOf)),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Per-user reads
-// ---------------------------------------------------------------------------
-
-export async function readShareBalance(address: string): Promise<bigint> {
-  return okUint(await readOnly(TOKEN_CONTRACT_NAME, "get-balance", [Cl.principal(address)], address), "get-balance");
-}
-
-export interface WithdrawalRequest {
-  id: number;
-  owner: string;
-  shares: bigint; // dsSTX escrowed by the request, burned at claim
-  lockedStx: bigint; // uSTX the request is entitled to, fixed at request time
-  claimableAt: number; // stacks-block-height
-  claimed: boolean;
-}
-
-export async function readWithdrawalRequest(id: number): Promise<WithdrawalRequest | null> {
-  const what = `get-withdrawal-request ${id}`;
-  const opt = okOf(await readOnly(VAULT_CONTRACT_NAME, "get-withdrawal-request", [Cl.uint(id)]), what); // (optional (tuple ...))
-  if (typeof opt?.type !== "string" || !opt.type.startsWith("(optional")) fail(what);
-  if (opt.value === null) return null;
-  const t = opt.value?.value;
-  if (!t) fail(what);
+export async function readState(): Promise<VaultState> {
+  const s = await ro("get-state");
+  const need = (k: string) => {
+    if (!(k in s)) throw new Error(`get-state missing ${k}`);
+    return s[k];
+  };
   return {
-    id,
-    owner: principalOf(t.owner, what),
-    shares: uintOf(t.shares, what),
-    lockedStx: uintOf(t["locked-stx-amount"], what),
-    claimableAt: Number(uintOf(t["claimable-at"], what)),
-    claimed: boolOf(t.claimed, what),
+    initialized: need("initialized"), admin: need("admin"), strategy: need("strategy"), guardian: need("guardian"),
+    feeRecipient: need("fee-recipient"), maxTvl: need("max-tvl"), feeBps: need("fee-bps"), maxDeployBps: need("max-deploy-bps"),
+    depositsPaused: need("deposits-paused"), sweepsPaused: need("sweeps-paused"), vaultStx: need("vault-stx"),
+    capitalAtStrategy: need("capital-at-strategy"), pendingDeposits: need("pending-deposits"), ringfenced: need("ringfenced"),
+    totalAssets: need("total-assets"), supply: need("supply"), pps: need("pps"), hwmPps: need("hwm-pps"),
+    sweepRefPps: need("sweep-ref-pps"), realizedPnl: need("realized-pnl"), currentEpoch: need("current-epoch"),
+    epochOpen: need("epoch-open"), overdue: need("overdue"), noChangePending: need("no-change-pending"),
   };
 }
 
-// ---------------------------------------------------------------------------
-// Chain state
-// ---------------------------------------------------------------------------
+export interface PendingChange { param: string; value: string | bigint | null; executableAt: bigint }
 
-export async function readCurrentBlockHeight(): Promise<number> {
-  const h = Number((await hiroGetJson(HIRO_API_BASE, "/v2/info"))?.stacks_tip_height);
-  if (!(h > 0)) throw new Error("/v2/info returned no stacks_tip_height");
-  return h;
+export async function readPendingChanges(): Promise<PendingChange[]> {
+  const p = await ro("get-pending-changes");
+  const out: PendingChange[] = [];
+  for (const [param, v] of Object.entries(p) as [string, any][]) {
+    if (v === null) continue;
+    if (param === "resume") out.push({ param: "resume-sweeps", value: null, executableAt: v as bigint });
+    else out.push({ param, value: v.value, executableAt: v["executable-at"] });
+  }
+  return out;
 }
 
+export async function readShareBalance(address: string): Promise<bigint> {
+  return ro("get-balance", [Cl.principal(address)], TOKEN_CONTRACT_NAME, address);
+}
+
+export interface IdleRequest { id: number; owner: string; amount: bigint; claimableAt: bigint }
+export async function readRequest(id: number): Promise<IdleRequest | null> {
+  const r = await ro("get-request", [Cl.uint(id)]);
+  return r ? { id, owner: r.owner, amount: r.amount, claimableAt: r["claimable-at"] } : null;
+}
+
+export interface Epoch {
+  id: bigint; startBurn: bigint; deployed: bigint; depTotal: bigint; wdSharesTotal: bigint; settled: boolean;
+  depSharesMinted: bigint; wdStxPaid: bigint; writtenOff: boolean;
+}
+export async function readEpoch(id: bigint): Promise<Epoch | null> {
+  const e = await ro("get-epoch", [Cl.uint(id)]);
+  if (!e) return null;
+  return {
+    id, startBurn: e["start-burn"], deployed: e.deployed, depTotal: e["dep-total"], wdSharesTotal: e["wd-shares-total"],
+    settled: e.settled, depSharesMinted: e["dep-shares-minted"], wdStxPaid: e["wd-stx-paid"], writtenOff: e["written-off"],
+  };
+}
+export const readEpochDeposit = (e: bigint, user: string): Promise<bigint> => ro("get-epoch-deposit", [Cl.uint(e), Cl.principal(user)]);
+export const readEpochWithdrawal = (e: bigint, user: string): Promise<bigint> => ro("get-epoch-withdrawal", [Cl.uint(e), Cl.principal(user)]);
+
+export async function readChainInfo(): Promise<{ burnHeight: bigint; networkId: number }> {
+  const j = await hiroGetJson(HIRO_API_BASE, "/v2/info");
+  const burn = Number(j?.burn_block_height);
+  const nid = Number(j?.network_id);
+  if (!(burn > 0) || !Number.isFinite(nid)) throw new Error("/v2/info returned incomplete data");
+  return { burnHeight: BigInt(burn), networkId: nid };
+}
 export async function readNetworkId(): Promise<number> {
-  const id = Number((await hiroGetJson(HIRO_API_BASE, "/v2/info"))?.network_id);
-  if (!Number.isFinite(id)) throw new Error("/v2/info returned no network_id");
-  return id;
-}
-
-// Real seconds per block over the most recent `window` blocks, from the chain's own block
-// timestamps (two requests). Every duration shown to a user is a block count converted with
-// this, never a fixed assumption. The contract was sized for 15.25 s/block; mainnet ran at
-// 13.38 over withdrawal #0's delay (see config.ts).
-export async function measureSecPerBlock(window: number): Promise<number> {
-  const latest = (await hiroGetJson(HIRO_API_BASE, "/extended/v2/blocks?limit=1"))?.results?.[0];
-  const tipHeight = Number(latest?.height);
-  const tipTime = Number(latest?.block_time);
-  if (!(tipHeight > window) || !(tipTime > 0)) throw new Error("couldn't read the latest block");
-  const pastTime = Number((await hiroGetJson(HIRO_API_BASE, `/extended/v2/blocks/${tipHeight - window}`))?.block_time);
-  if (!(pastTime > 0)) throw new Error("couldn't read a past block's time");
-  const secPerBlock = (tipTime - pastTime) / window;
-  if (!(secPerBlock >= 2 && secPerBlock <= 120)) throw new Error(`implausible block pace: ${secPerBlock}`);
-  return secPerBlock;
+  return (await readChainInfo()).networkId;
 }

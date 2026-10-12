@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DeepStack Vault — deposit</title>
+  <title>DeepStack Vault v2</title>
   <link rel="icon" href="data:," /> <!-- no favicon yet; stops a 404 in the console -->
   <link rel="stylesheet" href="/src/style.css" />
 </head>
@@ -12,6 +12,8 @@
     <div class="brand">DeepStack <span class="muted">vault</span></div>
     <div id="wallet-area"></div>
   </header>
+
+  <div id="network-banner" class="network-banner" hidden></div>
 
   <main>
     <div id="status-banner" class="status-banner" hidden></div>
@@ -27,7 +29,7 @@
     </section>
 
     <section class="panel warn" id="consent-gate">
-      <h2>Before you deposit — read this</h2>
+      <h2>Before you deposit, read this</h2>
       <div id="consent-body"></div>
     </section>
 
@@ -45,13 +47,18 @@
       <h2>Withdraw</h2>
       <div id="withdraw-body"></div>
     </section>
+
+    <section class="panel" id="queued-panel" hidden>
+      <h2>Your queued and claimable items</h2>
+      <div id="queued-body"></div>
+    </section>
   </main>
 
   <footer>
     <p>
       Contract: <code id="vault-addr-footer"></code> ·
       <a href="https://github.com/mattglory/deepstack" target="_blank" rel="noopener">source</a> ·
-      <a href="https://github.com/mattglory/deepstack/blob/main/docs/VAULT_DISCLOSURE.md" target="_blank" rel="noopener">full disclosure</a>
+      <a href="https://github.com/mattglory/deepstack/blob/main/docs/VAULT_V2_DESIGN.md" target="_blank" rel="noopener">v2 design</a>
     </p>
   </footer>
 

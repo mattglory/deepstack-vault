@@ -29,11 +29,12 @@ export async function waitForTx(txid: string, onTick?: (attempt: number) => void
   return { status: "timeout" };
 }
 
-// Parses a Clarity `(ok u0)` style repr string into the plain number inside, for the one place
-// this app needs a contract's RETURN VALUE (request-withdrawal's assigned id) rather than just
-// pass/fail. Returns null on anything that doesn't match this exact shape rather than guessing.
-export function parseOkUintRepr(repr: string | undefined): number | null {
-  if (!repr) return null;
-  const m = repr.match(/^\(ok u(\d+)\)$/);
-  return m ? Number(m[1]) : null;
+// request-withdrawal returns (ok { queued: bool, id: uint }): the idle request id, or the epoch
+// the shares were queued into. Hiro renders it as `(ok (tuple (id u3) (queued false)))`. Returns
+// null on anything else rather than guessing.
+export function parseRequestRepr(repr: string | undefined): { queued: boolean; id: number } | null {
+  if (!repr?.startsWith("(ok ")) return null;
+  const id = /\(id u(\d+)\)/.exec(repr);
+  const q = /\(queued (true|false)\)/.exec(repr);
+  return id && q ? { queued: q[1] === "true", id: Number(id[1]) } : null;
 }

@@ -6,7 +6,7 @@
 // — a visitor who only wants to read public vault stats shouldn't pay that download/parse cost
 // before ever clicking "Connect wallet". writes.ts does the same for the same reason.
 
-import { EXPECTED_NETWORK_ID } from "./config";
+import { EXPECTED_NETWORK_ID, NETWORK } from "./config";
 import { readNetworkId } from "./reads";
 
 export function getConnectedAddress(): string | null {
@@ -44,4 +44,11 @@ export async function disconnectWallet(): Promise<void> {
 export async function verifyMainnet(): Promise<{ ok: boolean; networkId: number }> {
   const networkId = await readNetworkId();
   return { ok: networkId === EXPECTED_NETWORK_ID, networkId };
+}
+
+// The wallet's address must belong to the site's network: SP/SM = mainnet, ST/SN = testnet.
+// A wallet still on the other network would sign for the wrong chain.
+export function addressMatchesNetwork(address: string): boolean {
+  const testnet = address.startsWith("ST") || address.startsWith("SN");
+  return NETWORK === "testnet" ? testnet : !testnet;
 }
