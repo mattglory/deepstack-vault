@@ -683,8 +683,10 @@ function renderLookupResult(): void {
   else if (lookupResult === "error") el.innerHTML = `<p class="notice bad">Couldn't check that just now. Try again in a moment.</p>`;
   else {
     const r = lookupResult;
-    const mine = address && r.owner === address ? " (yours, added above)" : "";
-    el.innerHTML = `<p class="notice">Owner ${shortAddr(r.owner)}${mine} · ${stx(r.amount)} · claimable from Bitcoin block ${r.claimableAt.toLocaleString()}</p>`;
+    const detail = `${stx(r.amount)} · claimable from Bitcoin block ${r.claimableAt.toLocaleString()}`;
+    el.innerHTML = address && r.owner === address
+      ? `<p class="notice">This request is yours and is now listed above. ${detail}</p>`
+      : `<p class="notice">This request belongs to another address (${shortAddr(r.owner)}). Only its owner can claim it. ${detail}</p>`;
   }
 }
 
